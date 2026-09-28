@@ -3,3 +3,5 @@ node_modules/
 # written by every run (npm run seed / demo / dev)
 logs/
 data/
+specs/
+CLAUDE.md
