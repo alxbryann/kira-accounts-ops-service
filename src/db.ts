@@ -21,6 +21,9 @@ create table if not exists transfers (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+-- One transfer per client idempotency key, enforced by the database so concurrent retries can't race past it.
+create unique index if not exists transfers_idempotency_key_uq
+  on transfers(idempotency_key) where idempotency_key is not null;
 create table if not exists ledger_entries (
   id bigserial primary key,
   transfer_id text,

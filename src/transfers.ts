@@ -35,11 +35,20 @@ export async function createOutboundTransfer(
 
   const id = newId('TX-');
   const fee = feeCents(opts.amount_cents);
-  await db.query(
+  // The insert itself claims the key: the unique index lets only one concurrent attempt win.
+  // The pre-check above is just a fast path; this is what actually guarantees one transfer per key.
+  const claimed = await db.query(
     `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
-     values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)`,
+     values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)
+     on conflict (idempotency_key) where idempotency_key is not null do nothing
+     returning id`,
     [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
   );
+  if (claimed.rows.length === 0) {
+    const winner = await getByIdemKey(db, opts.idempotency_key);
+    log('transfer.idempotent_hit', { idempotency_key: opts.idempotency_key, transfer_id: winner.id, concurrent: true }, cid);
+    return winner;
+  }
   await post(db, { transfer_id: id, account_id: opts.account_id, entry_type: 'hold', amount_cents: opts.amount_cents + fee, memo: 'reserve outbound' });
   log('transfer.created', { transfer_id: id, amount_cents: opts.amount_cents, fee_cents: fee, idempotency_key: opts.idempotency_key }, cid);
 
