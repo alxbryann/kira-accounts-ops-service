@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { availableCents } from '../src/ledger.js';
 import { createOutboundTransfer, getTransfer } from '../src/transfers.js';
 import { processOutbox } from '../src/outbox.js';
-import { fresh, FUNDING } from './helpers.js';
+import { fresh, ledgerFor, FUNDING } from './helpers.js';
 
 // TICKET-202: the provider reports the payout as 'reversed'.
 test('202: a reversed payout reaches a terminal state and releases its hold', async () => {
@@ -14,4 +14,8 @@ test('202: a reversed payout reaches a terminal state and releases its hold', as
   const after = await getTransfer(db, t.id);
   assert.ok(['returned', 'failed', 'reversed'].includes(after.status), `expected a terminal status, got '${after.status}'`);
   assert.equal(await availableCents(db, 'A'), FUNDING, 'funds must be released');
+  const l = await ledgerFor(db, t.id);
+  assert.equal(l.release?.n, 1, 'released exactly once');
+  assert.equal(l.release?.sum, l.hold?.sum, 'released exactly what was held');
+  assert.equal(l.debit, undefined, 'a reversed payout never left the account, so no debit');
 });

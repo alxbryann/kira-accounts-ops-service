@@ -86,6 +86,15 @@ export async function applyProviderResult(db: PGlite, transfer: any, status: str
   } else if (status === 'returned') {
     await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (returned)' });
     await setStatus(db, transfer.id, 'returned');
+  } else if (status === 'reversed') {
+    // Reversed before settlement: no debit was ever posted, so releasing the hold is the whole unwind.
+    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (reversed)' });
+    await setStatus(db, transfer.id, 'returned');
+  } else {
+    // Unknown statuses used to fall through silently and still log 'provider_result' (TICKET-202).
+    // Log loudly instead of throwing: a throw here re-queues the outbox row and re-submits the payout.
+    log('transfer.unhandled_provider_status', { transfer_id: transfer.id, from: transfer.status, provider_status: status }, cid, 'error');
+    return;
   }
   log('transfer.provider_result', { transfer_id: transfer.id, from: transfer.status, provider_status: status }, cid);
 }
