@@ -36,27 +36,35 @@ export async function createOutboundTransfer(
 
   const id = newId('TX-');
   const fee = feeCents(opts.amount_cents);
-  // The insert itself claims the key: the unique index lets only one concurrent attempt win.
-  // The pre-check above is just a fast path; this is what actually guarantees one transfer per key.
-  const claimed = await db.query(
-    `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
-     values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)
-     on conflict (idempotency_key) where idempotency_key is not null do nothing
-     returning id`,
-    [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
-  );
-  if (claimed.rows.length === 0) {
-    const winner = await getByIdemKey(db, opts.idempotency_key);
+  // Transfer, hold and outbox event commit together or not at all (TICKET-204). A crash in between used to
+  // leave a committed hold with no outbox event, so the worker never submitted it and the funds stayed locked.
+  const winner = await db.transaction(async (tx) => {
+    // The insert itself claims the key: the unique index lets only one concurrent attempt win.
+    // The pre-check above is just a fast path; this is what actually guarantees one transfer per key.
+    const claimed = await tx.query(
+      `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
+       values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)
+       on conflict (idempotency_key) where idempotency_key is not null do nothing
+       returning id`,
+      [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
+    );
+    if (claimed.rows.length === 0) {
+      return (await tx.query<any>(`select * from transfers where idempotency_key = $1`, [opts.idempotency_key])).rows[0];
+    }
+    await post(tx, { transfer_id: id, account_id: opts.account_id, entry_type: 'hold', amount_cents: opts.amount_cents + fee, memo: 'reserve outbound' });
+
+    if (faults.crashMidRequestFor && faults.crashMidRequestFor === opts.idempotency_key) {
+      throw new Error('process crashed (simulated)');
+    }
+    await tx.query(`insert into outbox(event_type, transfer_id) values ('transfer.submit', $1)`, [id]);
+    return null;
+  });
+  if (winner) {
     log('transfer.idempotent_hit', { idempotency_key: opts.idempotency_key, transfer_id: winner.id, concurrent: true }, cid);
     return winner;
   }
-  await post(db, { transfer_id: id, account_id: opts.account_id, entry_type: 'hold', amount_cents: opts.amount_cents + fee, memo: 'reserve outbound' });
+  // Logged only after commit, so the log never claims a transfer that was rolled back.
   log('transfer.created', { transfer_id: id, amount_cents: opts.amount_cents, fee_cents: fee, idempotency_key: opts.idempotency_key }, cid);
-
-  if (faults.crashMidRequestFor && faults.crashMidRequestFor === opts.idempotency_key) {
-    throw new Error('process crashed (simulated)');
-  }
-  await db.query(`insert into outbox(event_type, transfer_id) values ('transfer.submit', $1)`, [id]);
   log('outbox.enqueued', { transfer_id: id, event_type: 'transfer.submit' }, cid);
   return getTransfer(db, id);
 }

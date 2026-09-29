@@ -151,3 +151,54 @@ Same as 202: worker and webhook lines log under `WORKER-pass-N`, not the request
 
 ### Remediation (not solved by code)
 The fix stops new overstatements. It doesn't correct TX-0005, which already has the second `release` and status `failed`, and its events are already in `processed_events`, so a redelivery won't replay them. Ops should confirm with the provider that the payout settled, then post a correcting entry that reverses the extra release (−77,175 against Marea Pay's account, memo referencing TX-0005 / TICKET-203) and set the status back to `settled`. Until then the client's available balance is $771.75 too high. Other transfers with the same shape should be searched for: more than one `release` per transfer, or a `debit` on a transfer that isn't `settled`/`returned`.
+
+---
+
+## TICKET-204 — Payout stuck in `created` after an API crash
+
+### Reproduction
+`tests/ticket-204.test.ts` turns on the chaos hook (`faults.crashMidRequestFor = 'idem-204'`) and creates a $400.00 ACH payout. Before the fix both tests failed:
+1. `no transfer may be held with nothing to submit it`: `TX-0002` was left in `created`, with a hold and no outbox row.
+2. `the client retry after the crash gets the payout submitted`: the retry returned the stranded transfer, and it stayed `created` instead of reaching `settled`.
+
+The log shows the same shape: `grep CID-204 logs/incidents.ndjson` has `transfer.created` immediately followed by `api.crash`, and no `outbox.enqueued`.
+
+### Mechanism
+`createOutboundTransfer` made three writes, and each one committed on its own:
+
+1. `INSERT transfers` (status `created`): committed
+2. `INSERT ledger_entries` (`hold` for amount + fee): committed, funds locked
+3. `INSERT outbox` (`transfer.submit`): **never reached**
+
+The crash landed between 2 and 3. The worker finds work only through the `outbox` table, so a transfer with no outbox row is invisible to it: it is never submitted, no webhook ever arrives, and nothing ever releases the hold. `transfer.created` had already been logged before the crash, so the log reported a success that was actually broken.
+
+The client's retry couldn't repair it. The idempotency pre-check found the existing `idem-204` row and returned it (`transfer.idempotent_hit`), so the stranded transfer was handed back unchanged every time.
+
+The design flaw: the service used an outbox, but not a **transactional** outbox. The point of the pattern is that the business write and the event that drives it commit atomically. Here they didn't.
+
+### Fix
+`src/transfers.ts` (`createOutboundTransfer`): the transfer insert, the hold and the outbox insert now run in one `db.transaction`.
+- A crash anywhere before commit rolls all three back: no transfer, no hold, no outbox row.
+- The chaos hook stays between the hold and the outbox insert, now inside the transaction. That is the honest simulation: a real process death drops the connection, and Postgres aborts the uncommitted transaction.
+- The TICKET-201 `ON CONFLICT … DO NOTHING` claim moved inside the same transaction. The loser of a concurrent race reads the winner through `tx` and returns it without a hold or outbox event.
+- `transfer.created` and `outbox.enqueued` are logged only **after** commit, so the log never describes a transfer that was rolled back.
+
+### Why it can't recur
+A held transfer without an outbox event is no longer a state the database can commit: the hold and the event are written in the same transaction or not at all. Because a failed request leaves no row behind, the client's retry with the same idempotency key doesn't hit a stale transfer. It creates the payout from scratch and the worker submits it. The two tests assert both halves: no stranded transfer and no net hold after the crash, and the retry reaching `settled` with exactly amount + fee debited.
+
+On PGlite every `transaction` holds an exclusive lock. On multi-connection Postgres, a concurrent insert of the same idempotency key blocks on the unique index until the first transaction commits (then conflicts) or rolls back (then proceeds), so 201's guarantee holds across the crash too.
+
+### Ambiguity calls
+- **Transaction, not a sweeper.** A background job that finds `created` transfers without an outbox row and enqueues or cancels them would also clear the symptom. But it races with requests still in flight, and it has to guess whether to *pay* or *release* money the client never got a success response for. Making the state unreachable is stronger. The sweeper's query is still worth keeping as an ops-monitor check (`created` with no outbox row, older than N minutes) as a backstop.
+- **Heal-on-retry rejected.** Enqueuing the missing event when a retry hits a stranded transfer only works if the client retries, and the funds stay locked until then.
+- **Reordering the writes rejected.** Writing the outbox row first only moves the crash window: the worker could then submit a transfer that has no hold.
+
+### Still not atomic (next hole)
+The worker side isn't atomic either. `provider.submit` → `setStatus('submitted')` → mark outbox `processed` are separate steps, and a crash or timeout between them can resubmit to the provider. That is TICKET-205.
+
+### Remediation (not solved by code)
+The fix prevents new stranded payouts. It doesn't touch the seeded TX-0006, which is already committed as `created` with a $411.60 hold (amount + fee) and no outbox row. A retry with `idem-204` will keep returning it. The client received a crash response, not a success, and may already have resent the payout some other way, so **confirm with Marea Pay before acting**. Then either:
+- **proceed:** insert the missing `transfer.submit` outbox row so the worker pays it; or
+- **cancel:** post a `release` for 41,160 (memo referencing TX-0006 / TICKET-204) and set the status to `failed`, so the client resubmits with a new idempotency key.
+
+Other stranded transfers can be found with: `select t.id from transfers t where t.direction='outbound' and t.status='created' and not exists (select 1 from outbox o where o.transfer_id=t.id)`.
