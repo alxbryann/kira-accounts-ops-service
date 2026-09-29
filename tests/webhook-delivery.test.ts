@@ -15,6 +15,33 @@ async function submitted(key: string) {
   return { db, t, ref: `PROV-${key}` };
 }
 
+// Partial failure: the process dies while applying a webhook. The event id must not be consumed
+// unless its ledger entries and status change committed with it, or the redelivery is dropped as a duplicate.
+test('a crash while applying a webhook leaves it unconsumed, and the redelivery applies it once', async () => {
+  const { db, t, ref } = await submitted('idem-crash-evt');
+  faults.crashApplyingEvent = 'EVT-c';
+  await assert.rejects(handleWebhook(db, { provider_event_id: 'EVT-c', provider_ref: ref, status: 'settled' }));
+  faults.crashApplyingEvent = undefined;
+
+  assert.deepEqual(await rows(db, `select * from processed_events where provider_event_id='EVT-c'`), [], 'event id not consumed');
+  assert.equal((await getTransfer(db, t.id)).status, 'submitted');
+  assert.equal((await ledgerFor(db, t.id)).debit, undefined, 'nothing half-applied');
+
+  assert.equal((await handleWebhook(db, { provider_event_id: 'EVT-c', provider_ref: ref, status: 'settled' })).status, 'processed');
+  assert.equal((await getTransfer(db, t.id)).status, 'settled');
+  assert.equal(await availableCents(db, 'A'), FUNDING - TOTAL);
+});
+
+// Concurrency: the provider redelivers the same event while the first delivery is still in flight.
+test('the same event delivered twice concurrently is applied once and neither delivery errors', async () => {
+  const { db, t, ref } = await submitted('idem-dup-race');
+  const evt = { provider_event_id: 'EVT-d', provider_ref: ref, status: 'settled' };
+  const results = await Promise.all([handleWebhook(db, evt), handleWebhook(db, evt)]);
+  assert.deepEqual(results.map((r) => r.status).sort(), ['processed', 'skipped']);
+  const l = await ledgerFor(db, t.id);
+  assert.deepEqual([l.debit.n, l.release.n], [1, 1]);
+});
+
 // Event order: the outcome webhook arrives before we have stored the provider_ref (e.g. after a timeout).
 test('a webhook for a provider_ref we do not know yet is not consumed, so its redelivery is applied', async () => {
   const db = await fresh();

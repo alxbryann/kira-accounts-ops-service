@@ -39,7 +39,7 @@ export async function handleWebhook(db: PGlite, evt: { provider_event_id: string
   // If this event was parked earlier, it is now recognised: close it.
   await db.query(`update unhandled_provider_events set resolved_at = now() where provider_event_id = $1 and resolved_at is null`, [evt.provider_event_id]);
   log('webhook.received', { provider_event_id: evt.provider_event_id, provider_ref: evt.provider_ref, transfer_id: t.id, status: evt.status, current_status: t.status }, cid);
-  await applyProviderResult(db, t, status, cid);
+  await applyProviderResult(db, t, status, cid, evt.provider_event_id);
   return { status: 'processed' };
 }
 

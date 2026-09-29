@@ -131,7 +131,7 @@ export function planTransition(from: string, status: ProviderStatus): Transition
 
 // Apply a provider outcome to a transfer. The status read, the ledger entries and the status write happen
 // in one transaction, so two webhooks for the same transfer can't both plan from the same status.
-export async function applyProviderResult(db: PGlite, transfer: any, status: ProviderStatus, cid = '-') {
+export async function applyProviderResult(db: PGlite, transfer: any, status: ProviderStatus, cid = '-', eventId?: string) {
   const total = Number(transfer.amount_cents) + Number(transfer.fee_cents);
   const { from, plan } = await db.transaction(async (tx) => {
     const from: string = (await tx.query<any>(`select status from transfers where id = $1 for update`, [transfer.id])).rows[0].status;
@@ -140,6 +140,7 @@ export async function applyProviderResult(db: PGlite, transfer: any, status: Pro
     for (const e of plan.entries) {
       await post(tx, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: e.entry_type, amount_cents: total, memo: e.memo });
     }
+    if (eventId && faults.crashApplyingEvent === eventId) throw new Error('process crashed (simulated)');
     await tx.query(`update transfers set status = $1, updated_at = now() where id = $2`, [plan.to, transfer.id]);
     return { from, plan };
   });
