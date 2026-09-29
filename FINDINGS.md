@@ -363,6 +363,11 @@ Either way, record the decision and leave `fee_cents` on the old rows unchanged,
 
 The brief asks for fixes that hold "for any sequence of events and under concurrency". These are gaps left after 201–206; two of them were already listed as open above. Each was reproduced with a test that failed before its fix (`tests/webhook-delivery.test.ts`).
 
+### H1 — A webhook's event id was consumed before it was applied
+**Mechanism.** `handleWebhook` inserted `processed_events` in its own statement, *then* called `applyProviderResult` in a separate transaction. A crash in between (reproduced with a new chaos hook, `faults.crashApplyingEvent`, that throws after the ledger entries and before commit) rolled back the ledger work but kept the event id. The provider's redelivery was then skipped as a duplicate, and the transfer stayed `submitted` with its hold. This is the same bug class as 202, reached through a partial failure instead of an unknown status. A second symptom: two concurrent deliveries of the same event both passed the `select`, and the loser crashed with a primary-key violation (500).
+
+**Fix.** The event id is claimed with `insert … on conflict do nothing returning` **inside** the transaction that reads the status, posts the entries and writes the new status (`applyProviderResult(…, eventId)`). The outcome and "this event is done" now commit together or not at all. A concurrent duplicate gets no row back and returns `skipped`. The `select` in `handleWebhook` is kept only as a fast path. Resolving a parked (unknown-status) row moved into the same transaction.
+
 ### H2 — A webhook for a `provider_ref` we don't know yet was consumed and lost
 **Mechanism.** After a submit timeout (205) we don't know the `provider_ref` yet, and the outcome webhook can arrive before the retry stores it. `handleWebhook` marked the event processed and then returned `unknown_transfer`, so the redelivery was dropped. The transfer stayed `submitted` with its hold, although the provider had paid.
 

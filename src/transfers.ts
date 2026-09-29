@@ -129,11 +129,19 @@ export function planTransition(from: string, status: ProviderStatus): Transition
   return null;
 }
 
-// Apply a provider outcome to a transfer. The status read, the ledger entries and the status write happen
-// in one transaction, so two webhooks for the same transfer can't both plan from the same status.
-export async function applyProviderResult(db: PGlite, transfer: any, status: ProviderStatus, cid = '-', eventId?: string) {
+// Apply a provider outcome to a transfer. Claiming the event id, the status read, the ledger entries and the
+// status write happen in one transaction: two webhooks for the same transfer can't both plan from the same
+// status, and a crash mid-way leaves the event unconsumed so the provider's redelivery is applied, not skipped.
+// Returns 'duplicate' when another delivery of the same event id already claimed it.
+export async function applyProviderResult(db: PGlite, transfer: any, status: ProviderStatus, cid = '-', eventId?: string): Promise<'applied' | 'ignored' | 'duplicate'> {
   const total = Number(transfer.amount_cents) + Number(transfer.fee_cents);
-  const { from, plan } = await db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
+    if (eventId) {
+      const claimed = await tx.query(`insert into processed_events(provider_event_id) values ($1) on conflict do nothing returning 1`, [eventId]);
+      if (!claimed.rows.length) return { duplicate: true as const };
+      // If this event was parked earlier (unknown status), it is now recognised: close it.
+      await tx.query(`update unhandled_provider_events set resolved_at = now() where provider_event_id = $1 and resolved_at is null`, [eventId]);
+    }
     const from: string = (await tx.query<any>(`select status from transfers where id = $1 for update`, [transfer.id])).rows[0].status;
     const plan = planTransition(from, status);
     if (!plan) return { from, plan };
@@ -144,13 +152,20 @@ export async function applyProviderResult(db: PGlite, transfer: any, status: Pro
     await tx.query(`update transfers set status = $1, updated_at = now() where id = $2`, [plan.to, transfer.id]);
     return { from, plan };
   });
+  if ('duplicate' in outcome) {
+    log('webhook.duplicate_skipped', { provider_event_id: eventId, concurrent: true }, cid);
+    return 'duplicate';
+  }
+  const { from, plan } = outcome;
   if (!plan) {
     // Not an error on our side, but a payout the provider reports two different ways deserves a human look.
     log('transfer.transition_ignored', { transfer_id: transfer.id, from, provider_status: status }, cid, 'warn');
-    return;
+    return 'ignored';
   }
   if (from === 'failed' || from === 'settled') {
     log('transfer.outcome_changed', { transfer_id: transfer.id, from, to: plan.to, provider_status: status }, cid, 'warn');
   }
   log('transfer.provider_result', { transfer_id: transfer.id, from, to: plan.to, provider_status: status }, cid);
+  return 'applied';
 }
+

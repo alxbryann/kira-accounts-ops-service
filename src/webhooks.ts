@@ -4,6 +4,7 @@ import { normalizeProviderStatus } from './providers.js';
 import { log } from './logger.js';
 
 // Provider settlement webhook. Deliveries can be duplicated, so we de-dupe on provider_event_id.
+// The select below is only a fast path; the claim in applyProviderResult is what guarantees apply-once.
 export async function handleWebhook(db: PGlite, evt: { provider_event_id: string; provider_ref: string; status: string; correlation_id?: string }) {
   const cid = evt.correlation_id ?? '-';
   // Without an event id a delivery can't be de-duplicated, and without a ref it can't be matched: reject, don't guess.
@@ -35,12 +36,10 @@ export async function handleWebhook(db: PGlite, evt: { provider_event_id: string
     log('webhook.unknown_transfer', { provider_event_id: evt.provider_event_id, provider_ref: evt.provider_ref, status: evt.status }, cid, 'warn');
     return { status: 'unknown_transfer' };
   }
-  await db.query(`insert into processed_events(provider_event_id) values ($1)`, [evt.provider_event_id]);
-  // If this event was parked earlier, it is now recognised: close it.
-  await db.query(`update unhandled_provider_events set resolved_at = now() where provider_event_id = $1 and resolved_at is null`, [evt.provider_event_id]);
   log('webhook.received', { provider_event_id: evt.provider_event_id, provider_ref: evt.provider_ref, transfer_id: t.id, status: evt.status, current_status: t.status }, cid);
-  await applyProviderResult(db, t, status, cid, evt.provider_event_id);
-  return { status: 'processed' };
+  // The event id is claimed inside the same transaction that applies it (see applyProviderResult).
+  const res = await applyProviderResult(db, t, status, cid, evt.provider_event_id);
+  return { status: res === 'duplicate' ? 'skipped' : 'processed' };
 }
 
 // Re-run parked events through handleWebhook, e.g. after deploying support for a new status or alias.
