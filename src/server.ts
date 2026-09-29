@@ -5,7 +5,7 @@ import { processOutbox } from './outbox.js';
 import { createApp } from './app.js';
 import { processEscalations } from './escalations.js';
 import { mailTransportFromEnv } from './mailer.js';
-import { processTriageEscalation } from './triage-escalation.js';
+import { processTriageEscalation, sendTriageEscalations } from './triage-escalation.js';
 import { loadIncidentSnapshot } from './incident-snapshot.js';
 
 // Secrets (e.g. the Gmail credentials for escalation mail) come from a .env: the service's own,
@@ -33,8 +33,11 @@ setInterval(() => processOutbox(db).catch(() => {}), 2000);
 // failing SMTP server isn't hammered; failures are retried on the next pass.
 setInterval(() => processEscalations(db, mail).catch(() => {}), 30_000);
 // Escalate the triage report (email + dashboard) when it has new critical/high findings. First pass right away.
-const triagePass = () => processTriageEscalation(db, mail).catch((e) => console.error(`triage escalation: ${e.message}`));
+// A new escalation starts its AI summary immediately; the mail pass sends it once the summary is ready (or
+// failed / past its deadline), so it runs more often than the monitor to pick the summary up soon after it lands.
+const triagePass = () => processTriageEscalation(db).catch((e) => console.error(`triage escalation: ${e.message}`));
 triagePass();
 setInterval(triagePass, 60_000);
+setInterval(() => sendTriageEscalations(db, mail).catch((e) => console.error(`triage escalation mail: ${e.message}`)), 5_000);
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => console.log(`kira-accounts-ops-service on :${port} (seeded, in-memory; worker every 2s)`));

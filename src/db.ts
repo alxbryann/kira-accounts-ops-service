@@ -58,6 +58,9 @@ create table if not exists unhandled_provider_events (
   deliveries int not null default 1,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
+  summary text,                      -- LLM analysis of the unknown status (EN + ES), drafted when the event is parked
+  summary_status text not null default 'skipped', -- pending | ready | failed | skipped; the escalation mail waits while pending
+  summary_error text,
   escalated_at timestamptz,
   escalation_attempts int not null default 0,
   last_escalation_error text,
@@ -70,9 +73,11 @@ create table if not exists triage_escalations (
   fingerprint text not null,          -- the critical/high findings, so the same problem isn't mailed every pass
   report jsonb not null,
   summary text,                       -- LLM draft (EN + ES); null if not configured or it failed
+  summary_status text not null,       -- pending | ready | failed | skipped; the mail waits while pending
   summary_error text,
   created_at timestamptz not null default now(),
   sent_at timestamptz,
+  send_claimed_at timestamptz,        -- set while a mail pass is sending it, so overlapping passes don't both send
   send_attempts int not null default 0,
   last_error text
 );

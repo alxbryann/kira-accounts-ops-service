@@ -3,32 +3,82 @@ import type { MailTransport } from './mailer.js';
 import { toDollars } from './money.js';
 import { log } from './logger.js';
 import { esc, kira, when } from './html.js';
+import { draftUnhandledSummary, summaryConfigured, type ParkedEventForModel } from './triage-summary.js';
+import { PROVIDER_STATUSES } from './providers.js';
+import { SUMMARY_DEADLINE_MS, type SummaryStatus } from './triage-escalation.js';
 
 export type UnhandledEvent = {
   provider_event_id: string; provider_ref: string; raw_status: string; payload: unknown; deliveries: number;
   first_seen_at: Date; last_seen_at: Date; escalated_at: Date | null; escalation_attempts: number;
+  summary: string | null; summary_status: SummaryStatus; summary_error: string | null;
   last_escalation_error: string | null; resolved_at: Date | null;
   transfer_id: string | null; account_id: string | null; transfer_status: string | null; held_cents: number | null;
 };
 
 // Parked webhooks joined with the transfer they point at, oldest first.
-export async function listUnhandledEvents(db: PGlite, filter: 'all' | 'open' | 'to_escalate' = 'all'): Promise<UnhandledEvent[]> {
-  const where = { all: 'true', open: 'u.resolved_at is null', to_escalate: 'u.resolved_at is null and u.escalated_at is null' }[filter];
+export async function listUnhandledEvents(db: PGlite, filter: 'all' | 'open' | 'to_escalate' | { id: string } = 'all'): Promise<UnhandledEvent[]> {
+  const byId = typeof filter === 'object';
+  const where = byId ? 'u.provider_event_id = $1'
+    : { all: 'true', open: 'u.resolved_at is null', to_escalate: 'u.resolved_at is null and u.escalated_at is null' }[filter];
   const r = await db.query<any>(`
     select u.*, t.id as transfer_id, t.account_id, t.status as transfer_status,
       -- What is still reserved for the transfer, straight from the ledger (holds minus releases).
       (select sum(case l.entry_type when 'hold' then l.amount_cents when 'release' then -l.amount_cents else 0 end)
          from ledger_entries l where l.transfer_id = t.id) as held_cents
     from unhandled_provider_events u left join transfers t on t.provider_ref = u.provider_ref
-    where ${where} order by u.first_seen_at, u.provider_event_id`);
+    where ${where} order by u.first_seen_at, u.provider_event_id`, byId ? [filter.id] : []);
   return r.rows.map((x) => ({ ...x, held_cents: x.held_cents == null ? null : Number(x.held_cents) }));
+}
+
+export type UnhandledDrafter = (e: ParkedEventForModel) => Promise<string>;
+// DeepSeek when a key is configured, otherwise no analysis (the event is parked as 'skipped').
+export const defaultUnhandledDrafter = (): UnhandledDrafter | null =>
+  summaryConfigured() ? (e) => draftUnhandledSummary(e, PROVIDER_STATUSES) : null;
+
+const drafting = new Set<Promise<void>>();
+// Settles when every analysis started so far is stored; for the CLI and tests (the server never waits on it).
+export const unhandledSummariesSettled = async () => { await Promise.all([...drafting]); };
+
+// Called by handleWebhook the first time an event is parked. Runs in the background and never rejects, so the
+// webhook response never waits on the LLM. Only a still-pending event is updated: if the deadline already
+// mailed it without the analysis, a late one is dropped and the dashboard keeps showing what was mailed.
+export function startUnhandledSummary(db: PGlite, id: string, draft: UnhandledDrafter, cid = '-') {
+  const job = (async () => {
+    try {
+      const [e] = await listUnhandledEvents(db, { id });
+      if (!e) return;
+      const summary = await draft({ ...e, status_received: e.raw_status });
+      const ok = await db.query(`update unhandled_provider_events set summary = $2, summary_status = 'ready' where provider_event_id = $1 and summary_status = 'pending' returning 1`, [id, summary]);
+      log(ok.rows.length ? 'ops.unhandled_summary_ready' : 'ops.unhandled_summary_late', { provider_event_id: id }, cid, ok.rows.length ? 'info' : 'warn');
+    } catch (err: any) {
+      const error = String(err?.message ?? err);
+      await db.query(`update unhandled_provider_events set summary_error = $2, summary_status = 'failed' where provider_event_id = $1 and summary_status = 'pending'`, [id, error])
+        .catch(() => {});
+      log('ops.unhandled_summary_failed', { provider_event_id: id, error }, cid, 'warn');
+    }
+  })();
+  drafting.add(job);
+  job.finally(() => drafting.delete(job));
+  return job;
 }
 
 // Escalate newly parked webhooks to ops by email: one mail per pass listing every new event, so a burst
 // of the same unknown status doesn't send hundreds of mails. Runs outside the webhook path (like the
 // outbox worker): a slow or failing SMTP never delays or fails a webhook, and a failed send is retried next pass.
-export async function processEscalations(db: PGlite, transport: MailTransport, opts: { to?: string; dashboardUrl?: string } = {}, cid = 'ESCALATIONS') {
-  const pending = await listUnhandledEvents(db, 'to_escalate');
+// An event whose AI analysis is still pending waits for a later pass, up to the same deadline as the triage
+// mail; past it, it goes out without the analysis (the alert matters more than the analysis).
+export async function processEscalations(
+  db: PGlite, transport: MailTransport, opts: { to?: string; dashboardUrl?: string; summaryDeadlineMs?: number } = {}, cid = 'ESCALATIONS',
+) {
+  const deadline = opts.summaryDeadlineMs ?? SUMMARY_DEADLINE_MS;
+  const expired = await db.query<{ provider_event_id: string }>(
+    `update unhandled_provider_events set summary_status = 'failed', summary_error = $1
+     where escalated_at is null and resolved_at is null and summary_status = 'pending' and first_seen_at <= now() - $2 * interval '1 millisecond'
+     returning provider_event_id`,
+    [`no analysis after ${Math.round(deadline / 1000)}s; sent without it`, deadline]);
+  for (const r of expired.rows) log('ops.unhandled_summary_timeout', { provider_event_id: r.provider_event_id }, cid, 'warn');
+
+  const pending = (await listUnhandledEvents(db, 'to_escalate')).filter((e) => e.summary_status !== 'pending');
   if (!pending.length) return { sent: 0 };
   const ids = pending.map((e) => e.provider_event_id);
   // Without an explicit recipient, escalate to the Gmail account that sends (if configured).
@@ -48,6 +98,7 @@ export async function processEscalations(db: PGlite, transport: MailTransport, o
 
 // raw_status comes straight from the webhook body: cap it so a hostile or broken payload can't bloat the mail.
 const clip = (s: string, n = 80) => (s.length > n ? s.slice(0, n) + '…' : s);
+const AI_NOTE = 'AI draft; the status meaning is a guess to confirm in the provider docs';
 const NEXT_STEPS = `Check the status in the provider's docs, add it (or an alias) in normalizeProviderStatus / applyProviderResult, deploy, then press "Replay open events" on the dashboard.`;
 
 export function escalationMail(events: UnhandledEvent[], dashboardUrl: string) {
@@ -61,6 +112,7 @@ export function escalationMail(events: UnhandledEvent[], dashboardUrl: string) {
       ? `  Transfer ${e.transfer_id} · account ${e.account_id} · status ${e.transfer_status} · $${toDollars(e.held_cents ?? 0)} held`
       : `  No transfer matches this provider ref`,
     `  First seen ${new Date(e.first_seen_at).toISOString()} · deliveries ${e.deliveries}`,
+    ...(e.summary ? ['', `  AI analysis (${AI_NOTE}):`, ...e.summary.split('\n').map((l) => `  ${l}`)] : []),
   ].join('\n'));
   return {
     subject: `[Kira ops] ${n} provider webhook${n === 1 ? '' : 's'} with an unrecognised status`,
@@ -93,6 +145,10 @@ function escalationMailHtml(events: UnhandledEvent[], dashboardUrl: string, intr
               : kv('Transfer', dim('No matching transfer'))}
             ${kv('First seen', `${esc(when(e.first_seen_at))} ${dim(`· ${e.deliveries} deliver${e.deliveries === 1 ? 'y' : 'ies'}`)}`)}
           </table>
+          ${e.summary ? `<div style="margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.08);">
+            <div style="${eyebrow}">AI analysis · Análisis</div>
+            <div style="margin-top:10px;font-family:${k.font};font-size:14px;line-height:1.6;color:${k.text};white-space:pre-wrap;">${esc(e.summary)}</div>
+            <div style="margin-top:10px;font-family:${k.font};font-size:11px;color:${k.textMuted};">${esc(AI_NOTE)}.</div></div>` : ''}
         </td></tr>
       </table>
     </td></tr>`;

@@ -4,7 +4,7 @@ import { seedInto } from './bootstrap.js';
 import { loadIncidentSnapshot } from './incident-snapshot.js';
 import { runTriage, formatReport } from './monitor.js';
 import { draftSummary } from './triage-summary.js';
-import { processTriageEscalation, latestEscalation } from './triage-escalation.js';
+import { processTriageEscalation, sendTriageEscalations, latestEscalation } from './triage-escalation.js';
 import { mailTransportFromEnv } from './mailer.js';
 
 // npm run monitor [-- --snapshot] [--json] [--ai] [--escalate] [--stuck-after=N]
@@ -26,10 +26,13 @@ const stuckAfter = stuckArg === undefined ? undefined : Number(stuckArg);
 const report = await runTriage(db, { stuckAfter });
 
 if (flag('--escalate')) {
-  const res = await processTriageEscalation(db, mailTransportFromEnv(), { stuckAfter });
+  // One-shot: wait for the summary (it has its own 60 s API timeout), then run the mail pass once.
+  const res = await processTriageEscalation(db, { stuckAfter });
+  if (res.escalated) await res.drafted;
+  const [sent] = await sendTriageEscalations(db, mailTransportFromEnv());
   const e = await latestEscalation(db);
-  console.error(res.escalated ? `Escalation email sent (${e?.summary ? 'with' : 'without'} AI summary${e?.summary_error ? `: ${e.summary_error}` : ''}).`
-    : report.status === 'action_needed' ? `Escalation NOT sent: ${'error' in res ? res.error : 'unknown error'}` : 'Nothing to escalate.');
+  console.error(sent?.sent ? `Escalation email sent (${e?.summary ? 'with' : 'without'} AI summary${e?.summary_error ? `: ${e.summary_error}` : ''}).`
+    : report.status === 'action_needed' ? `Escalation NOT sent: ${sent?.error ?? 'unknown error'}` : 'Nothing to escalate.');
 }
 if (flag('--json')) console.log(JSON.stringify(report, null, 2));
 else {

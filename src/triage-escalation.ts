@@ -6,10 +6,17 @@ import { toDollars } from './money.js';
 import { esc, kira, when } from './html.js';
 import { log } from './logger.js';
 
+export type SummaryStatus = 'pending' | 'ready' | 'failed' | 'skipped';
 export type TriageEscalation = {
-  id: number; fingerprint: string; report: TriageReport; summary: string | null; summary_error: string | null;
-  created_at: Date; sent_at: Date | null; send_attempts: number; last_error: string | null;
+  id: number; fingerprint: string; report: TriageReport; summary: string | null; summary_status: SummaryStatus; summary_error: string | null;
+  created_at: Date; sent_at: Date | null; send_claimed_at: Date | null; send_attempts: number; last_error: string | null;
 };
+
+// How long a mail waits for its AI summary before going out without it. The summary is optional; the alert is not,
+// so a hung or lost draft (e.g. the process restarted mid-call) must not hold a critical escalation back for good.
+export const SUMMARY_DEADLINE_MS = 2 * 60_000;
+// A mail pass that claimed an escalation and died before finishing: after this long another pass may take it over.
+const CLAIM_TIMEOUT = '5 minutes';
 
 // What makes two passes "the same problem": the critical/high findings. Stuck payouts (medium) come and go
 // with the clock and would mail on every pass, so they ride along in the report but don't trigger a mail.
@@ -21,46 +28,85 @@ export async function latestEscalation(db: PGlite): Promise<TriageEscalation | n
   return (await db.query<any>(`select * from triage_escalations order by id desc limit 1`)).rows[0] ?? null;
 }
 
-// Escalate the triage report to ops: when the monitor has critical/high findings that weren't escalated
-// before, draft the plain-language summary (optional, a failure doesn't block the mail), store report and
-// summary, and send one email with both. Runs outside the request path, like the outbox worker; a failed
-// send is retried on the next pass with the stored summary, so the LLM is called once per escalation.
+// Step 1 (monitor pass): when the monitor has critical/high findings that weren't escalated before, store the
+// report and start drafting the plain-language summary right away, without waiting for it. The mail is sent
+// separately by sendTriageEscalations once the summary is ready. `drafted` settles when the draft is stored,
+// for callers that want to wait (the CLI, tests); the server doesn't. The LLM is called once per escalation.
 export async function processTriageEscalation(
+  db: PGlite,
+  opts: { stuckAfter?: number; draft?: ((r: TriageReport) => Promise<string>) | null } = {},
+  cid = 'TRIAGE',
+): Promise<{ escalated: false; id?: number } | { escalated: true; id: number; drafted: Promise<void> }> {
+  const report = await runTriage(db, { stuckAfter: opts.stuckAfter });
+  if (report.status !== 'action_needed') return { escalated: false };
+  const fp = fingerprint(report);
+  const last = await latestEscalation(db);
+  if (last && last.fingerprint === fp) return { escalated: false, id: last.id };
+
+  // null: explicitly no summary; undefined: DeepSeek if a key is configured.
+  const draft = opts.draft !== undefined ? opts.draft : summaryConfigured() ? (r: TriageReport) => draftSummary(r) : null;
+  const row: TriageEscalation = (await db.query<any>(
+    `insert into triage_escalations(fingerprint, report, summary_status) values ($1, $2, $3) returning *`,
+    [fp, JSON.stringify(report), draft ? 'pending' : 'skipped'])).rows[0];
+  log('ops.triage_escalation_created', { escalation_id: row.id, findings: report.totals.findings, summary: row.summary_status }, cid, 'warn');
+  return { escalated: true, id: row.id, drafted: draft ? storeDraft(db, row.id, report, draft, cid) : Promise.resolve() };
+}
+
+// Runs in the background; never rejects. Only a still-pending row is updated: if the deadline already sent the
+// mail without a summary, a late draft is dropped, so the dashboard keeps showing exactly what was mailed.
+async function storeDraft(db: PGlite, id: number, report: TriageReport, draft: (r: TriageReport) => Promise<string>, cid: string) {
+  try {
+    const summary = await draft(report);
+    const ok = await db.query(`update triage_escalations set summary = $2, summary_status = 'ready' where id = $1 and summary_status = 'pending' returning id`, [id, summary]);
+    log(ok.rows.length ? 'ops.triage_summary_ready' : 'ops.triage_summary_late', { escalation_id: id }, cid, ok.rows.length ? 'info' : 'warn');
+  } catch (e: any) {
+    const error = String(e?.message ?? e);
+    await db.query(`update triage_escalations set summary_error = $2, summary_status = 'failed' where id = $1 and summary_status = 'pending'`, [id, error])
+      .catch(() => {});
+    log('ops.triage_summary_failed', { escalation_id: id, error }, cid, 'warn');
+  }
+}
+
+// Step 2 (mail worker): send every unsent escalation whose summary is no longer pending: ready (with it), or
+// failed/skipped (report only). A pending one is left for a later pass, unless it has waited past the deadline.
+// A failed send is retried on the next pass with the stored summary, never re-drafted.
+export async function sendTriageEscalations(
   db: PGlite, transport: MailTransport,
-  opts: { to?: string; dashboardUrl?: string; stuckAfter?: number; draft?: (r: TriageReport) => Promise<string> } = {},
+  opts: { to?: string; dashboardUrl?: string; summaryDeadlineMs?: number } = {},
   cid = 'TRIAGE',
 ) {
-  const report = await runTriage(db, { stuckAfter: opts.stuckAfter });
-  const last = await latestEscalation(db);
-  let row: TriageEscalation;
-  if (report.status !== 'action_needed') return { escalated: false as const };
-  const fp = fingerprint(report);
-  if (last && last.fingerprint === fp) {
-    if (last.sent_at) return { escalated: false as const, id: last.id };
-    row = last; // same findings, previous send failed: retry it
-  } else {
-    const draft = opts.draft ?? (summaryConfigured() ? (r: TriageReport) => draftSummary(r) : undefined);
-    let summary: string | null = null, summaryError: string | null = null;
-    if (draft) { try { summary = await draft(report); } catch (e: any) { summaryError = String(e?.message ?? e); } }
-    row = (await db.query<any>(
-      `insert into triage_escalations(fingerprint, report, summary, summary_error) values ($1, $2, $3, $4) returning *`,
-      [fp, JSON.stringify(report), summary, summaryError])).rows[0];
-    if (summaryError) log('ops.triage_summary_failed', { escalation_id: row.id, error: summaryError }, cid, 'warn');
-  }
+  const deadline = opts.summaryDeadlineMs ?? SUMMARY_DEADLINE_MS;
+  const expired = await db.query<{ id: number }>(
+    `update triage_escalations set summary_status = 'failed', summary_error = $1
+     where sent_at is null and summary_status = 'pending' and created_at <= now() - $2 * interval '1 millisecond' returning id`,
+    [`no summary after ${Math.round(deadline / 1000)}s; sent without it`, deadline]);
+  for (const { id } of expired.rows) log('ops.triage_summary_timeout', { escalation_id: id }, cid, 'warn');
 
   const to = opts.to ?? process.env.ALERT_EMAIL_TO ?? process.env.gmail ?? 'ops@localhost';
   const dashboardUrl = opts.dashboardUrl ?? process.env.OPS_DASHBOARD_URL ?? `http://localhost:${process.env.PORT ?? 3000}/ops`;
-  try {
-    await transport.send({ to, ...triageMail(row.report, row.summary, dashboardUrl) });
-    await db.query(`update triage_escalations set sent_at = now(), send_attempts = send_attempts + 1, last_error = null where id = $1`, [row.id]);
-    log('ops.triage_escalated', { escalation_id: row.id, to, findings: row.report.totals.findings }, cid, 'warn');
-    return { escalated: true as const, id: row.id };
-  } catch (e: any) {
-    const error = String(e?.message ?? e);
-    await db.query(`update triage_escalations set send_attempts = send_attempts + 1, last_error = $2 where id = $1`, [row.id, error]);
-    log('ops.triage_escalation_failed', { escalation_id: row.id, to, error }, cid, 'error');
-    return { escalated: false as const, id: row.id, error };
+  const ready = (await db.query<{ id: number }>(
+    `select id from triage_escalations where sent_at is null and summary_status <> 'pending' order by id`)).rows;
+  const results: { id: number; sent: boolean; error?: string }[] = [];
+  for (const { id } of ready) {
+    // Claim before sending: two overlapping passes (a slow SMTP call outlasts the interval) must not both mail it.
+    const row: TriageEscalation | undefined = (await db.query<any>(
+      `update triage_escalations set send_claimed_at = now()
+       where id = $1 and sent_at is null and (send_claimed_at is null or send_claimed_at < now() - interval '${CLAIM_TIMEOUT}') returning *`,
+      [id])).rows[0];
+    if (!row) continue;
+    try {
+      await transport.send({ to, ...triageMail(row.report, row.summary, dashboardUrl) });
+      await db.query(`update triage_escalations set sent_at = now(), send_claimed_at = null, send_attempts = send_attempts + 1, last_error = null where id = $1`, [id]);
+      log('ops.triage_escalated', { escalation_id: id, to, findings: row.report.totals.findings, summary: row.summary_status }, cid, 'warn');
+      results.push({ id, sent: true });
+    } catch (e: any) {
+      const error = String(e?.message ?? e);
+      await db.query(`update triage_escalations set send_claimed_at = null, send_attempts = send_attempts + 1, last_error = $2 where id = $1`, [id, error]);
+      log('ops.triage_escalation_failed', { escalation_id: id, to, error }, cid, 'error');
+      results.push({ id, sent: false, error });
+    }
   }
+  return results;
 }
 
 const usd = (c: number) => '$' + Number(toDollars(c)).toLocaleString('en-US', { minimumFractionDigits: 2 });

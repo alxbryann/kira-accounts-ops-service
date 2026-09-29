@@ -9,7 +9,17 @@ function escalationPill(e: UnhandledEvent) {
   if (e.resolved_at) return `<span class="pill pill-ok"><i></i>Resolved</span><div class="sub">${esc(when(e.resolved_at))}</div>`;
   if (e.escalated_at) return `<span class="pill pill-ok"><i></i>Email sent</span><div class="sub">${esc(when(e.escalated_at))}</div>`;
   if (e.last_escalation_error) return `<span class="pill pill-bad" title="${esc(e.last_escalation_error)}">Email failed ×${e.escalation_attempts}</span><div class="sub">retrying</div>`;
-  return `<span class="pill pill-wait">Pending</span>`;
+  return `<span class="pill pill-wait">Pending</span>${e.summary_status === 'pending' ? '<div class="sub">waiting for the AI analysis</div>' : ''}`;
+}
+
+// The AI analysis as mailed, under the event's row.
+function analysisRow(e: UnhandledEvent) {
+  const body = e.summary
+    ? `<div class="summary">${esc(e.summary)}</div><div class="sub">AI draft; the status meaning is a guess to confirm in the provider docs.</div>`
+    : e.summary_status === 'pending' ? '<div class="sub">AI analysis in progress; the email waits for it (or goes without it if it fails or takes too long).</div>'
+    : e.summary_status === 'failed' ? `<div class="sub">AI analysis unavailable: ${esc(e.summary_error ?? '')}</div>`
+    : '';
+  return body ? `<tr class="analysis"><td colspan="6"><div class="eyebrow">AI analysis · Análisis</div>${body}</td></tr>` : '';
 }
 
 function row(e: UnhandledEvent) {
@@ -22,7 +32,7 @@ function row(e: UnhandledEvent) {
     <td class="num strong">${e.held_cents == null ? '—' : '$' + toDollars(e.held_cents)}</td>
     <td>${esc(when(e.first_seen_at))}<div class="sub">${e.deliveries} deliver${e.deliveries === 1 ? 'y' : 'ies'}</div></td>
     <td>${escalationPill(e)}</td>
-  </tr>`;
+  </tr>${analysisRow(e)}`;
 }
 
 function table(events: UnhandledEvent[], empty: string) {
@@ -81,10 +91,13 @@ function escalationCard(e: TriageEscalation | null | undefined) {
   if (!e) return '';
   const pill = e.sent_at ? `<span class="pill pill-ok"><i></i>Email sent</span> <span class="sub">${esc(when(e.sent_at))}</span>`
     : e.last_error ? `<span class="pill pill-bad" title="${esc(e.last_error)}">Email failed ×${e.send_attempts}</span> <span class="sub">retrying</span>`
+    : e.summary_status === 'pending' ? '<span class="pill pill-wait">Pending</span> <span class="sub">waiting for the AI summary</span>'
     : '<span class="pill pill-wait">Sending</span>';
   const summary = e.summary
     ? `<div class="summary">${esc(e.summary)}</div><div class="sub">AI draft from the report; check it against the report before sharing.</div>`
-    : `<div class="sub">${e.summary_error ? `AI summary unavailable: ${esc(e.summary_error)}` : 'No AI summary (deepseek_api_key not set).'} The full report is in the email and at /ops/triage.txt.</div>`;
+    : e.summary_status === 'pending'
+      ? '<div class="sub">AI summary in progress. The email goes out with it as soon as it is ready, or without it if it fails or takes too long.</div>'
+      : `<div class="sub">${e.summary_error ? `AI summary unavailable: ${esc(e.summary_error)}` : 'No AI summary (deepseek_api_key not set).'} The full report is in the email and at /ops/triage.txt.</div>`;
   return `<div class="card escalation"><div class="esc-head"><div class="eyebrow">Last escalation · ${esc(when(e.created_at))}</div><div>${pill}</div></div>
     <div class="sub">${e.report.totals.findings} finding(s) · up to $${toDollars(e.report.totals.at_risk_cents)} affected</div>${summary}</div>`;
 }
@@ -180,6 +193,8 @@ export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash, tr
 
   .escalation { padding:24px 28px; margin-bottom:24px; }
   .esc-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
+  tr.analysis td { padding-top:0; }
+  tr.analysis .summary { max-width:900px; }
   .summary { white-space:pre-wrap; margin:16px 0 10px; line-height:1.65; color:var(--text); }
   .empty { display:flex; align-items:center; gap:12px; padding:28px; color:var(--muted); }
   .flash { display:inline-flex; align-items:center; gap:12px; padding:14px 20px; margin-top:32px; text-align:left; }

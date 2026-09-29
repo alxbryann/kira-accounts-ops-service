@@ -2,10 +2,15 @@ import type { PGlite } from '@electric-sql/pglite';
 import { applyProviderResult } from './transfers.js';
 import { normalizeProviderStatus } from './providers.js';
 import { log } from './logger.js';
+import { defaultUnhandledDrafter, startUnhandledSummary, type UnhandledDrafter } from './escalations.js';
 
 // Provider settlement webhook. Deliveries can be duplicated, so we de-dupe on provider_event_id.
 // The select below is only a fast path; the claim in applyProviderResult is what guarantees apply-once.
-export async function handleWebhook(db: PGlite, evt: { provider_event_id: string; provider_ref: string; status: string; correlation_id?: string }) {
+// opts.draftUnhandled: who analyses a newly parked unknown status (default: DeepSeek if configured; null: nobody).
+export async function handleWebhook(
+  db: PGlite, evt: { provider_event_id: string; provider_ref: string; status: string; correlation_id?: string },
+  opts: { draftUnhandled?: UnhandledDrafter | null } = {},
+) {
   const cid = evt.correlation_id ?? '-';
   // Without an event id a delivery can't be de-duplicated, and without a ref it can't be matched: reject, don't guess.
   for (const f of ['provider_event_id', 'provider_ref'] as const) {
@@ -19,13 +24,18 @@ export async function handleWebhook(db: PGlite, evt: { provider_event_id: string
   const status = normalizeProviderStatus(evt.status);
   if (!status) {
     const { correlation_id: _cid, ...payload } = evt;
-    await db.query(
-      `insert into unhandled_provider_events(provider_event_id, provider_ref, raw_status, payload) values ($1, $2, $3, $4)
+    const draft = opts.draftUnhandled !== undefined ? opts.draftUnhandled : defaultUnhandledDrafter();
+    const parked = await db.query<{ deliveries: number }>(
+      `insert into unhandled_provider_events(provider_event_id, provider_ref, raw_status, payload, summary_status) values ($1, $2, $3, $4, $5)
        on conflict (provider_event_id) do update set deliveries = unhandled_provider_events.deliveries + 1,
-         raw_status = excluded.raw_status, payload = excluded.payload, last_seen_at = now()`,
-      [evt.provider_event_id, evt.provider_ref, String(evt.status), JSON.stringify(payload)],
+         raw_status = excluded.raw_status, payload = excluded.payload, last_seen_at = now()
+       returning deliveries`,
+      [evt.provider_event_id, evt.provider_ref, String(evt.status), JSON.stringify(payload), draft ? 'pending' : 'skipped'],
     );
     log('webhook.unhandled_status', { provider_event_id: evt.provider_event_id, provider_ref: evt.provider_ref, status: evt.status }, cid, 'error');
+    // First delivery only (the insert, not a redelivery): start the AI analysis now, without waiting for it.
+    // Concurrent first deliveries race on the primary key, so exactly one of them sees deliveries = 1.
+    if (draft && parked.rows[0].deliveries === 1) startUnhandledSummary(db, evt.provider_event_id, draft, cid);
     return { status: 'unhandled_status' };
   }
 
