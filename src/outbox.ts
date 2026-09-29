@@ -1,6 +1,6 @@
 import type { PGlite } from '@electric-sql/pglite';
 import * as provider from './providers.js';
-import { getTransfer, setStatus } from './transfers.js';
+import { getTransfer, markSubmitted } from './transfers.js';
 import { handleWebhook } from './webhooks.js';
 import { log } from './logger.js';
 
@@ -16,7 +16,7 @@ export async function processOutbox(db: PGlite, cid = 'WORKER') {
       // The transfer id is the provider idempotency key (TICKET-205): a timeout can hide an accepted payment,
       // so every retry must carry the same key and the provider returns the original acceptance instead of paying again.
       const res = provider.submit(t, t.id);
-      await setStatus(db, t.id, 'submitted', res.provider_ref);
+      await markSubmitted(db, t.id, res.provider_ref);
       await db.query(`update outbox set status='processed', processed_at=now(), attempts=attempts+1 where id=$1`, [ev.id]);
       log('provider.submitted', { transfer_id: t.id, provider_ref: res.provider_ref, attempt: ev.attempts + 1 }, cid);
       for (const w of res.webhooks) await handleWebhook(db, { ...w, correlation_id: cid });

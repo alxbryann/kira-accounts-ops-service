@@ -169,3 +169,15 @@ export async function applyProviderResult(db: PGlite, transfer: any, status: Pro
   return 'applied';
 }
 
+// The worker's write after the provider accepted a submission. Only 'created' moves to 'submitted': a re-run of
+// the submit (crash before the outbox row was marked processed) can find the payout already settled/failed by a
+// webhook, and dragging it back to 'submitted' would re-open it to a second release. The provider_ref is kept
+// if already known: with the idempotency key (TICKET-205) a re-run returns the same ref anyway.
+export async function markSubmitted(db: PGlite, id: string, provider_ref: string) {
+  const r = await db.query<any>(
+    `update transfers set status = case when status = 'created' then 'submitted' else status end,
+       provider_ref = coalesce(provider_ref, $2),
+       updated_at = case when status = 'created' then now() else updated_at end
+     where id = $1 returning status, provider_ref`, [id, provider_ref]);
+  return r.rows[0] as { status: string; provider_ref: string };
+}
