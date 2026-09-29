@@ -71,7 +71,7 @@ The provider side confirms the money never left: the submission is recorded with
 
 ### Ambiguity calls
 - **Final status `returned` vs a new `reversed` status.** I chose `returned`. It is an existing terminal status, so the schema, the dashboard and reconciliation don't change, and the ledger effect is identical. The ledger memo still records that the provider said `reversed`. Trade-off: the client and the provider call it "reversed", and in payments "returned" often means the receiving bank bounced it. A separate status would read closer to the provider's own wording.
-- **Release, not debit + credit.** Before settlement our ledger only has a `hold`, so a `release` undoes it exactly. Posting a debit and a credit would record a payment and a refund that never happened. A reversal that arrives **after** `settled` (a real-world clawback) is different: the debit already happened, so it needs a `credit`. Which transitions are legal from which state is the state machine TICKET-203 introduces. **Until 203 lands, `reversed` after `settled` would release the money a second time.** That is the same bug class as 203, not a regression from this change.
+- **Release, not debit + credit.** Before settlement our ledger only has a `hold`, so a `release` undoes it exactly. Posting a debit and a credit would record a payment and a refund that never happened. A reversal that arrives **after** `settled` (a real-world clawback) is different: the debit already happened, so it needs a `credit`. Which transitions are legal from which state is the state machine TICKET-203 introduces. **Until 203 lands, `reversed` after `settled` would release the money a second time.** That is the same bug class as 203, not a regression from this change. *(Resolved in TICKET-203: it now posts a `credit`.)*
 - **Unknown status: park, don't throw.** Throwing looks stricter but causes harm here. The worker delivers webhooks inside the outbox `try`: a throw lands in its `catch`, which puts the row back to `pending`, and the next pass calls `provider.submit` again with no idempotency key. That pays the vendor twice. Parking the event keeps it recoverable without touching the outbox.
 - **`200` for an unknown status, not `422`.** The event is safely parked, so asking the provider to retry would only add a retry storm on something we can't process yet. Trade-off: recovery depends on the provider redelivering the event, or on a replay tool over `unhandled_provider_events`, which doesn't exist yet (follow-up). If we'd rather lean on the provider's retries, switching the endpoint to `422` is a one-line change.
 - **No provider aliases yet.** `normalizeProviderStatus` only normalizes case and whitespace. Mapping e.g. `completed → settled` without the provider's docs would be guessing what money movement a word means, so aliases are added only once confirmed.
@@ -82,3 +82,72 @@ The worker logs under `WORKER-pass-N` instead of the request's `correlation_id`,
 
 ### Remediation (not solved by code)
 TX-0004 in the seeded data stays `submitted` with its hold, because `EVT-0004` was already consumed and is in `processed_events`. Ops should confirm with the provider that the reversal is final, then either replay the outcome (`applyProviderResult(tx, 'reversed')`) or ask the provider to resend it with a fresh event id.
+
+---
+
+## TICKET-203 — Payout shows "failed" but the provider paid it; balance overstated
+
+### Reproduction
+`tests/ticket-203.test.ts` creates a $750.00 ACH payout with sandbox scenario `out_of_order` and runs the worker. The provider accepts it and sends two webhooks with **distinct** event ids: `settled`, then `failed`. Before the fix the test failed with `expected 'settled', got 'failed'`.
+
+As in 202, `grep CID-203 logs/incidents.ndjson` shows only `transfer.created` and `outbox.enqueued`, because the worker logs under its own correlation id. The ledger for the transfer tells the story (amount + fee = 77,175):
+
+| # | entry | memo | effect on available |
+|---|---|---|---|
+| 1 | `hold` | reserve outbound | −771.75 |
+| 2 | `debit` | settle outbound | −771.75 |
+| 3 | `release` | release hold (settled) | +771.75 |
+| 4 | `release` | release hold (failed) | **+771.75** |
+
+Net effect: **0**. Available balance stays at 1,000,000 instead of 922,825, so the client can spend $771.75 that has already left through the provider. Entry 4 also overwrote the status with `failed`, which is what the dashboard shows.
+
+### Mechanism
+`applyProviderResult` decided what to do from the **incoming event alone**. It never looked at the transfer's current status. Every webhook posted its ledger entries and overwrote the status, whatever had already happened.
+
+The dedupe in `handleWebhook` doesn't help here. It keys on `provider_event_id`, which catches the *same* event delivered twice, but these are two different events with contradictory outcomes, so both pass. The provider is the source of truth that it paid: the submission is recorded with `outcome: 'settled'` and `statement()` includes it.
+
+The same hole existed for every second outcome, not just `settled → failed`:
+- `settled → returned/reversed` released the hold a second time (flagged in 202's ambiguity calls).
+- `failed → settled` posted a debit **and** another release: two releases against one hold.
+- a late `pending` after `settled` moved the status back to `pending`.
+
+### Fix
+`src/transfers.ts`:
+- New **`planTransition(from, status)`**: the transfer state machine. Given the current status and the provider outcome, it returns the new status and the ledger entries to post, or `null` when the event must be ignored:
+
+  | from | event | result |
+  |---|---|---|
+  | `created` / `submitted` / `pending` | `settled` | debit + release → `settled` |
+  | same | `failed` / `returned` / `reversed` | release → `failed` / `returned` |
+  | same | `pending` | → `pending` |
+  | `settled` | `returned` / `reversed` | **credit** → `returned` (clawback) |
+  | `failed` | `settled` | **debit only** → `settled` (hold already released) |
+  | anything else | — | ignored |
+
+- **`applyProviderResult`** now reads the status (`select … for update`), plans from it, posts the entries and writes the new status in **one `db.transaction`**. Ignored events log `transfer.transition_ignored` (warn) and post nothing. A settled or failed payout changing outcome logs `transfer.outcome_changed` (warn). `transfer.provider_result` now also records `to`.
+- The `never` exhaustiveness check from 202 is kept inside the open-state `switch`.
+
+### Why it can't recur
+- The decision depends on the transfer's current status, so a stale or contradictory event can't undo a final outcome. Every path keeps the ledger at one hold, at most one release, at most one debit and at most one credit, so the same money can't be released twice.
+- Read, decide and write happen in one transaction. PGlite runs every `query` and `transaction` under a single exclusive lock, and on multi-connection Postgres `for update` serializes the two webhooks on the transfer row. Two webhooks for the same transfer can't both plan from the same old status.
+- `tests/ticket-203.test.ts` goes from 1 test to 5:
+  1. the incident (`settled → failed`): status stays `settled`, balance = funding − 77,175, release = hold, one debit, nothing posted by the stale `failed`;
+  2. **every sequence of 1–3 provider events (155)**: release ≤ hold, ≤ 1 debit, ≤ 1 credit, balance matches the final status, and once `settled` has been seen the payout ends `settled` or `returned`, never `failed`/`pending`;
+  3. `settled → returned → reversed → settled → failed`: refunded exactly once, and nothing after it moves it again;
+  4. `failed → settled`: the missing debit is posted and the release isn't repeated;
+  5. `settled` and `failed` delivered concurrently: the hold is released once, and the balance matches whichever outcome won.
+
+  All 5 fail against the old `applyProviderResult` and pass with the fix. The 204/205/206 failures in the suite are the same before and after this change.
+
+### Ambiguity calls
+- **`settled` wins over `failed`, in either order.** `settled` is the provider saying the money left, and its statement counts it as paid. Keeping `failed` would repeat this ticket: an overstated balance and overdraft risk. The opposite mistake (debiting a payout that really failed) shows up in reconciliation against the provider statement and is recoverable; letting a client spend money that is gone may not be.
+- **Return/reversal after settlement → `credit`, applied automatically.** The debit already happened and the hold is already released, so money coming back is a credit, as noted in 202. The alternative is to park it for manual review before giving the client the funds back (safer against a bogus provider event, slower for a real one). That would be a one-line change in `planTransition`.
+- **Ignore, don't reject.** A contradictory event is still marked processed and answered `processed`. It is a valid provider message we have deliberately decided not to act on, so parking it (as 202 does for unknown statuses) or failing it (which makes the provider retry) would add nothing. The warn logs are what surface it to ops.
+- **`returned` is fully terminal.** `returned` can mean "released before settlement" or "credited after settlement", and a later `settled` can't tell which. Rather than guess, it is ignored and logged.
+- **Lifecycle coverage is partial.** The machine governs provider outcomes only. `created` is set on insert, and `submitted` is still written unconditionally by the outbox worker via `setStatus` (`src/outbox.ts:17`). That's safe today, because the worker only submits `created` transfers, but a stray `setStatus` could still move a final transfer backwards. Follow-up: route `created → submitted` through the state machine as well. It was left out here because it touches the outbox path that 204/205 are changing.
+
+### Follow-up (observability)
+Same as 202: worker and webhook lines log under `WORKER-pass-N`, not the request's correlation id, so `grep CID-203` doesn't show the two contradictory webhooks. `transfer.outcome_changed` / `transfer.transition_ignored` are worth an alert: a provider that reports two outcomes for one payout needs a human to confirm which is real.
+
+### Remediation (not solved by code)
+The fix stops new overstatements. It doesn't correct TX-0005, which already has the second `release` and status `failed`, and its events are already in `processed_events`, so a redelivery won't replay them. Ops should confirm with the provider that the payout settled, then post a correcting entry that reverses the extra release (−77,175 against Marea Pay's account, memo referencing TX-0005 / TICKET-203) and set the status back to `settled`. Until then the client's available balance is $771.75 too high. Other transfers with the same shape should be searched for: more than one `release` per transfer, or a `debit` on a transfer that isn't `settled`/`returned`.
