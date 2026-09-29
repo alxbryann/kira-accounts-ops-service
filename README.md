@@ -63,3 +63,8 @@ npm run typecheck
 3. A small **Ops triage monitor** that flags these anomaly classes. *Optional:* an LLM-drafted summary.
 4. A **client-facing incident note in English and Spanish** for one ticket.
 
+## Where the deliverables are
+- Fixes + regression tests: `src/`, `tests/ticket-20*.test.ts`, `tests/webhook-delivery.test.ts`
+- `FINDINGS.md`: per ticket, plus the delivery hardening, the monitor and verification
+- Ops triage monitor: `src/monitor.ts` (`npm run monitor`, `/ops/triage`, `/ops`)
+- Bilingual client note: `INCIDENT-NOTE-203.md`

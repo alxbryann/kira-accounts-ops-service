@@ -416,3 +416,10 @@ On the snapshot it flags all six tickets. 201: duplicate `idem-201`. 202: stuck 
 **Ambiguity calls**
 - **Provider data source.** The double-submission check reads the mock's `submissions`. Against a real provider it would read their transfers or statement API, which is the only place a payout we never recorded can show up.
 - **What the monitor doesn't do.** It never auto-corrects. Every fix it suggests (release a hold, post a correcting entry, re-queue) is a money decision that needs the provider's confirmation or the client's answer first.
+
+## Client note
+`INCIDENT-NOTE-203.md`: the client-facing write-up for TICKET-203 in English and Spanish. It covers what happened, why, what we fixed, the one correcting entry on their balance, and prevention. It doesn't guess a cause the logs don't support, and it names the balance correction up front, because that is the part a client will notice.
+
+## Verification
+`npm test`: 49 tests pass. `npm run typecheck`: clean. `npm run demo`: every ticket shows its fixed state and reconciliation diff = 0¢. `npm run monitor`: all clear. `npm run monitor -- --snapshot`: all six classes flagged. An end-to-end escalation with the real DeepSeek API (mail to `.eml`) produced a correct EN/ES summary.
+
