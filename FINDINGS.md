@@ -274,7 +274,7 @@ The worker doesn't need to know which case it was. This also closes the worker-s
 - **`submit`'s key is still optional.** The next caller that writes `provider.submit(t)` (e.g. a manual resubmit on `/ops`) would bring the bug back without any warning. Follow-up, in the spirit of 202's `never` check: a single `submitTransfer(t)` wrapper that always derives the key, so there's no way to submit without one.
 
 ### Still open (found while fixing this)
-- **A webhook that arrives before `provider_ref` is saved is lost.** After a timeout we never learn the `provider_ref`. In production the `settled` webhook comes over HTTP, and it can arrive before the retry. `handleWebhook` writes `processed_events` before it looks up the transfer, so the event is consumed as `unknown_transfer`, and the redelivery is skipped as a duplicate. The transfer stays `submitted` with its hold, although the provider paid. Reproduced by hand: first delivery `unknown_transfer`, redelivery `skipped`, final status `submitted`. It's the same bug class as 202, where an event is consumed that couldn't be applied. The fix is the same too: only mark the event processed once the transfer is found, and otherwise park it for replay. Alternatively, send our transfer id to the provider so the webhook carries it. In this test the idempotent retry happens to repair it, because the mock returns the late webhook in the retry response.
+- **A webhook that arrives before `provider_ref` is saved is lost.** *(Resolved in Hardening H2 below.)* After a timeout we never learn the `provider_ref`. In production the `settled` webhook comes over HTTP, and it can arrive before the retry. `handleWebhook` writes `processed_events` before it looks up the transfer, so the event is consumed as `unknown_transfer`, and the redelivery is skipped as a duplicate. The transfer stays `submitted` with its hold, although the provider paid. Reproduced by hand: first delivery `unknown_transfer`, redelivery `skipped`, final status `submitted`. It's the same bug class as 202, where an event is consumed that couldn't be applied. The fix is the same too: only mark the event processed once the transfer is found, and otherwise park it for replay. Alternatively, send our transfer id to the provider so the webhook carries it. In this test the idempotent retry happens to repair it, because the mock returns the late webhook in the retry response.
 - **An exhausted retry after a timeout may have been paid.** When the outbox row reaches `MAX_ATTEMPTS` and goes to `failed`, the transfer stays `created` with its hold. That's correct, because releasing the hold could hand back money that already left. But nothing escalates it beyond the stuck-payouts view, and it needs a human to ask the provider.
 
 ### Follow-up (observability)
@@ -356,3 +356,16 @@ Either way, record the decision and leave `fee_cents` on the old rows unchanged,
 ### Follow-up
 - **Make reconciliation self-explaining.** Today it returns one `diffCents` plus three lists, and it takes manual work to tell "a whole payout is missing" (the class of 203/205) from "1¢ fee drift" (206). Returning the diff per bucket (`statementOnlyCents`, `ledgerOnlyCents`, `feeDriftCents`) would let the ops monitor alert on each separately.
 - **Cover what reconciliation can't see.** A duplicate idempotency key among settled transfers (201), and non-final transfers older than N minutes that still hold funds (202/204), are both invisible to a totals match. The second one is already on `/ops/stuck-transfers`.
+
+---
+
+## Hardening — webhook delivery and worker partial failures
+
+The brief asks for fixes that hold "for any sequence of events and under concurrency". These are gaps left after 201–206; two of them were already listed as open above. Each was reproduced with a test that failed before its fix (`tests/webhook-delivery.test.ts`).
+
+### H2 — A webhook for a `provider_ref` we don't know yet was consumed and lost
+**Mechanism.** After a submit timeout (205) we don't know the `provider_ref` yet, and the outcome webhook can arrive before the retry stores it. `handleWebhook` marked the event processed and then returned `unknown_transfer`, so the redelivery was dropped. The transfer stayed `submitted` with its hold, although the provider had paid.
+
+**Fix.** An unknown `provider_ref` no longer consumes the event. It is logged (`webhook.unknown_transfer`, warn) and answered `unknown_transfer`, so the provider's redelivery is applied once the ref is stored. A durable inbox for these, with replay, like `unhandled_provider_events`, is the next step if the provider's redelivery window turns out to be short.
+
+**Related input validation.** A webhook without `provider_event_id` or `provider_ref` is now rejected with `400`: it can't be de-duplicated or matched. `tests/api.test.ts` (from the original kit) asserted `500` for this case, because the missing id used to blow up on the `processed_events` insert. The test's intent was that a thrown error is answered and the server keeps serving, and that is unchanged. The expected status is now `400`.

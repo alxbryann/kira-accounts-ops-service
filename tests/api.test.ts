@@ -33,10 +33,10 @@ test('GET /transfers/:id for an unknown id is a 404', async () => {
   await s.close();
 });
 
-test('an error inside a handler is a 500 and the server keeps serving', async () => {
+test('an error thrown inside a handler is answered, not fatal, and the server keeps serving', async () => {
   const s = await serve();
   const r = await post(`${s.base}/webhooks/provider`, { provider_ref: 'PROV-0001', status: 'settled' }); // no provider_event_id
-  assert.equal(r.status, 500);
+  assert.equal(r.status, 400, 'a webhook without an event id cannot be de-duplicated, so it is rejected');
   assert.match((await r.json()).error, /provider_event_id/);
   assert.equal((await fetch(`${s.base}/health`)).status, 200);
   await s.close();
