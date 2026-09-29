@@ -55,3 +55,23 @@ test('a webhook for a provider_ref we do not know yet is not consumed, so its re
   assert.equal((await getTransfer(db, t.id)).status, 'settled');
   assert.equal(await availableCents(db, 'A'), FUNDING - TOTAL);
 });
+
+// Partial failure on the worker side: the outcome webhook lands (over HTTP) before the worker has marked
+// its outbox row processed, so the worker re-runs the submit. That re-run must not drag the transfer back to
+// 'submitted', or a later stale 'failed' would release the hold a second time (the TICKET-203 class).
+test('a re-run of the submit after the payout settled does not move it back to submitted', async () => {
+  const db = await fresh();
+  const t = await createOutboundTransfer(db, { account_id: 'A', rail: 'ach', amount_cents: 75_000, idempotency_key: 'idem-rerun' });
+  await processOutbox(db);
+  assert.equal((await getTransfer(db, t.id)).status, 'settled');
+  const ref = (await getTransfer(db, t.id)).provider_ref;
+
+  await db.query(`update outbox set status='pending' where transfer_id=$1`, [t.id]); // crash before 'processed' was written
+  await processOutbox(db);
+  assert.equal((await getTransfer(db, t.id)).status, 'settled', 'a final status is never overwritten by the worker');
+  assert.equal((await getTransfer(db, t.id)).provider_ref, ref);
+
+  await handleWebhook(db, { provider_event_id: 'EVT-stale', provider_ref: ref, status: 'failed' });
+  assert.equal(await availableCents(db, 'A'), FUNDING - TOTAL, 'balance not overstated');
+  assert.equal((await ledgerFor(db, t.id)).release.n, 1);
+});
