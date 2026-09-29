@@ -47,6 +47,16 @@ create table if not exists processed_events (
   provider_event_id text primary key,
   processed_at timestamptz not null default now()
 );
+-- Webhooks whose status we don't recognise. They are parked here instead of being marked processed,
+-- so they can be replayed once the status is supported (a redelivery of the same event is re-evaluated).
+create table if not exists unhandled_provider_events (
+  provider_event_id text primary key,
+  provider_ref text,
+  raw_status text,
+  deliveries int not null default 1,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now()
+);
 `;
 
 export async function openDb(dataDir?: string): Promise<PGlite> {

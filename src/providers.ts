@@ -6,6 +6,19 @@
 // Sandbox scenario codes (set on the transfer, like a test card number):
 //   ok | reversed | out_of_order | timeout_once
 export type WebhookEvent = { provider_event_id: string; provider_ref: string; status: string };
+
+// Every outcome status we know how to apply. The raw webhook status is an untrusted string;
+// it only becomes a ProviderStatus through normalizeProviderStatus.
+export const PROVIDER_STATUSES = ['pending', 'settled', 'failed', 'returned', 'reversed'] as const;
+export type ProviderStatus = (typeof PROVIDER_STATUSES)[number];
+
+// The one place that maps what the provider sends onto our statuses. Provider aliases
+// (e.g. a different spelling for 'settled') belong here, once confirmed against the provider's docs.
+export function normalizeProviderStatus(raw: unknown): ProviderStatus | null {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim().toLowerCase();
+  return (PROVIDER_STATUSES as readonly string[]).includes(s) ? (s as ProviderStatus) : null;
+}
 export type Submission = { provider_ref: string; transfer_id: string; amount_cents: number; idem_key?: string; accepted_at: string; outcome: 'settled' | 'reversed' };
 
 let seq = 0;

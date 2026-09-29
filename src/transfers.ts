@@ -3,6 +3,7 @@ import { feeCents } from './money.js';
 import { post } from './ledger.js';
 import { log } from './logger.js';
 import { faults } from './faults.js';
+import type { ProviderStatus } from './providers.js';
 
 // Ids count up per prefix (TX-0001, TX-0002, ...), so every run of the seed produces the same ids
 // and the log written by one run names the same transfers another run serves.
@@ -72,29 +73,38 @@ export async function setStatus(db: PGlite, id: string, status: string, provider
 }
 
 // Apply a provider outcome to a transfer.
-export async function applyProviderResult(db: PGlite, transfer: any, status: string, cid = '-') {
+export async function applyProviderResult(db: PGlite, transfer: any, status: ProviderStatus, cid = '-') {
   const total = Number(transfer.amount_cents) + Number(transfer.fee_cents);
-  if (status === 'pending') {
-    await setStatus(db, transfer.id, 'pending');
-  } else if (status === 'settled') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
-    await setStatus(db, transfer.id, 'settled');
-  } else if (status === 'failed') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (failed)' });
-    await setStatus(db, transfer.id, 'failed');
-  } else if (status === 'returned') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (returned)' });
-    await setStatus(db, transfer.id, 'returned');
-  } else if (status === 'reversed') {
-    // Reversed before settlement: no debit was ever posted, so releasing the hold is the whole unwind.
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (reversed)' });
-    await setStatus(db, transfer.id, 'returned');
-  } else {
-    // Unknown statuses used to fall through silently and still log 'provider_result' (TICKET-202).
-    // Log loudly instead of throwing: a throw here re-queues the outbox row and re-submits the payout.
-    log('transfer.unhandled_provider_status', { transfer_id: transfer.id, from: transfer.status, provider_status: status }, cid, 'error');
-    return;
+  switch (status) {
+    case 'pending':
+      await setStatus(db, transfer.id, 'pending');
+      break;
+    case 'settled':
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
+      await setStatus(db, transfer.id, 'settled');
+      break;
+    case 'failed':
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (failed)' });
+      await setStatus(db, transfer.id, 'failed');
+      break;
+    case 'returned':
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (returned)' });
+      await setStatus(db, transfer.id, 'returned');
+      break;
+    case 'reversed':
+      // Reversed before settlement: no debit was ever posted, so releasing the hold is the whole unwind.
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (reversed)' });
+      await setStatus(db, transfer.id, 'returned');
+      break;
+    default: {
+      // Adding a status to PROVIDER_STATUSES without a case here is a compile error.
+      // Unknown statuses used to fall through silently and still log 'provider_result' (TICKET-202).
+      // Log loudly instead of throwing: a throw here re-queues the outbox row and re-submits the payout.
+      const unhandled: never = status;
+      log('transfer.unhandled_provider_status', { transfer_id: transfer.id, from: transfer.status, provider_status: unhandled }, cid, 'error');
+      return;
+    }
   }
   log('transfer.provider_result', { transfer_id: transfer.id, from: transfer.status, provider_status: status }, cid);
 }
