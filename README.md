@@ -39,8 +39,9 @@ npm run dev      # API on :3000 — /health, /accounts/:id/balance, POST /transf
                  #   escalation mail: SMTP_URL, ALERT_EMAIL_TO, ALERT_EMAIL_FROM, OPS_DASHBOARD_URL
                  #   (without SMTP_URL mails are written to ./logs/mail/*.eml)
                  #   (PORT=3100 npm run dev if :3000 is busy)
-npm run monitor  # ops triage report (add -- --snapshot for the pre-fix incident state, --json, --ai)
-                 #   AI summary: deepseek_api_key in .env
+npm run monitor  # ops triage report (add -- --snapshot for the pre-fix incident state, --json, --ai, --escalate)
+                 #   AI summary: deepseek_api_key in .env · OPS_SNAPSHOT=1 npm run dev serves the snapshot
+                 #   the server escalates new critical/high findings by email + on /ops every 60s
                  #   live: GET /ops/triage (JSON), GET /ops/triage.txt (report)
 npm test         # baseline + regression suite
 npm run typecheck
@@ -61,3 +62,4 @@ npm run typecheck
 2. `FINDINGS.md` — per ticket: how you reproduced it, the exact mechanism, the fix, and why it can't recur.
 3. A small **Ops triage monitor** that flags these anomaly classes. *Optional:* an LLM-drafted summary.
 4. A **client-facing incident note in English and Spanish** for one ticket.
+

@@ -63,6 +63,19 @@ create table if not exists unhandled_provider_events (
   last_escalation_error text,
   resolved_at timestamptz
 );
+-- Triage monitor escalations (src/triage-escalation.ts): one row per distinct set of critical/high findings.
+-- Keeps the report and the AI summary as sent, so the dashboard shows exactly what ops received by email.
+create table if not exists triage_escalations (
+  id bigserial primary key,
+  fingerprint text not null,          -- the critical/high findings, so the same problem isn't mailed every pass
+  report jsonb not null,
+  summary text,                       -- LLM draft (EN + ES); null if not configured or it failed
+  summary_error text,
+  created_at timestamptz not null default now(),
+  sent_at timestamptz,
+  send_attempts int not null default 0,
+  last_error text
+);
 `;
 
 export async function openDb(dataDir?: string): Promise<PGlite> {

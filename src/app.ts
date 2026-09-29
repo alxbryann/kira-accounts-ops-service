@@ -9,6 +9,7 @@ import { listStuckTransfers, stuckAfterMinutes } from './stuck.js';
 import { processOutbox } from './outbox.js';
 import { reconcile } from './reconciliation.js';
 import { runTriage, formatReport } from './monitor.js';
+import { latestEscalation } from './triage-escalation.js';
 import * as provider from './providers.js';
 import { log } from './logger.js';
 
@@ -43,7 +44,7 @@ export function createApp(db: PGlite) {
     const replayed = Number(req.query.replayed), still = Number(req.query.still);
     const flash = Number.isInteger(replayed) && Number.isInteger(still) ? `Replayed ${replayed} event(s); ${still} still unrecognised.` : undefined;
     const stuckAfter = stuckAfterMinutes(req.query.stuck_after ?? process.env.STUCK_AFTER_MINUTES);
-    res.type('html').send(renderDashboard({ events: await listUnhandledEvents(db), stuck: await listStuckTransfers(db, stuckAfter), stuckAfter, flash, triage: await runTriage(db, { stuckAfter }) }));
+    res.type('html').send(renderDashboard({ events: await listUnhandledEvents(db), stuck: await listStuckTransfers(db, stuckAfter), stuckAfter, flash, triage: await runTriage(db, { stuckAfter }), escalation: await latestEscalation(db) }));
   }));
   // Ops triage monitor (src/monitor.ts): every anomaly class, as JSON for alerting or as a plain-text report for people.
   app.get('/ops/triage', wrap(async (req, res) => res.json(await runTriage(db, { stuckAfter: stuckAfterMinutes(req.query.stuck_after ?? process.env.STUCK_AFTER_MINUTES) }))));

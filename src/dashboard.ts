@@ -1,6 +1,7 @@
 import type { UnhandledEvent } from './escalations.js';
 import type { StuckTransfer, StuckReason } from './stuck.js';
 import type { TriageReport } from './monitor.js';
+import type { TriageEscalation } from './triage-escalation.js';
 import { toDollars } from './money.js';
 import { esc, kira, when } from './html.js';
 
@@ -75,12 +76,25 @@ function triageTable(r: TriageReport) {
     </tr>`).join('')}</tbody></table></div>`;
 }
 
+// The last triage escalation, exactly as mailed: when, whether the mail went out, and the AI summary.
+function escalationCard(e: TriageEscalation | null | undefined) {
+  if (!e) return '';
+  const pill = e.sent_at ? `<span class="pill pill-ok"><i></i>Email sent</span> <span class="sub">${esc(when(e.sent_at))}</span>`
+    : e.last_error ? `<span class="pill pill-bad" title="${esc(e.last_error)}">Email failed ×${e.send_attempts}</span> <span class="sub">retrying</span>`
+    : '<span class="pill pill-wait">Sending</span>';
+  const summary = e.summary
+    ? `<div class="summary">${esc(e.summary)}</div><div class="sub">AI draft from the report; check it against the report before sharing.</div>`
+    : `<div class="sub">${e.summary_error ? `AI summary unavailable: ${esc(e.summary_error)}` : 'No AI summary (deepseek_api_key not set).'} The full report is in the email and at /ops/triage.txt.</div>`;
+  return `<div class="card escalation"><div class="esc-head"><div class="eyebrow">Last escalation · ${esc(when(e.created_at))}</div><div>${pill}</div></div>
+    <div class="sub">${e.report.totals.findings} finding(s) · up to $${toDollars(e.report.totals.at_risk_cents)} affected</div>${summary}</div>`;
+}
+
 // Simple stand-in for the Kira mark (a magenta diamond, same as in the escalation email); not the official asset.
 export const kiraMark = (size = 18) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true">
   <defs><linearGradient id="km" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${kira.pinkSoft}"/><stop offset="1" stop-color="${kira.magenta}"/></linearGradient></defs>
   <rect x="4.5" y="4.5" width="15" height="15" rx="2.5" transform="rotate(45 12 12)" fill="url(#km)"/></svg>`;
 
-export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash, triage }: { events: UnhandledEvent[]; stuck?: StuckTransfer[]; stuckAfter?: number; flash?: string; triage?: TriageReport }) {
+export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash, triage, escalation }: { events: UnhandledEvent[]; stuck?: StuckTransfer[]; stuckAfter?: number; flash?: string; triage?: TriageReport; escalation?: TriageEscalation | null }) {
   const open = events.filter((e) => !e.resolved_at);
   const resolved = events.filter((e) => e.resolved_at);
   // A transfer can be both stuck and the target of an open event: count its hold once.
@@ -164,6 +178,9 @@ export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash, tr
   .pill-wait { background:rgba(255,255,255,.06); color:var(--soft); border:1px solid var(--border-subtle); }
   .pill-bad { background:var(--pink); color:#fff; }
 
+  .escalation { padding:24px 28px; margin-bottom:24px; }
+  .esc-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px; }
+  .summary { white-space:pre-wrap; margin:16px 0 10px; line-height:1.65; color:var(--text); }
   .empty { display:flex; align-items:center; gap:12px; padding:28px; color:var(--muted); }
   .flash { display:inline-flex; align-items:center; gap:12px; padding:14px 20px; margin-top:32px; text-align:left; }
 
@@ -206,6 +223,7 @@ export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash, tr
         <div><div class="eyebrow">00 / Triage monitor</div><h2>${triage.status === 'ok' ? 'All clear' : triage.status === 'attention' ? 'Needs a look' : 'Action needed'}</h2>
           <div class="hint">Every anomaly class behind the incident tickets. The full report, with a next step for each finding, is at <a class="strong" href="/ops/triage.txt">/ops/triage.txt</a>.</div></div>
       </div>
+      ${escalationCard(escalation)}
       ${triageTable(triage)}
     </section>` : ''}
 

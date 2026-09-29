@@ -4,11 +4,14 @@ import { seedInto } from './bootstrap.js';
 import { loadIncidentSnapshot } from './incident-snapshot.js';
 import { runTriage, formatReport } from './monitor.js';
 import { draftSummary } from './triage-summary.js';
+import { processTriageEscalation, latestEscalation } from './triage-escalation.js';
+import { mailTransportFromEnv } from './mailer.js';
 
-// npm run monitor [-- --snapshot] [--json] [--ai] [--stuck-after=N]
+// npm run monitor [-- --snapshot] [--json] [--ai] [--escalate] [--stuck-after=N]
 //   --snapshot     run against the pre-fix incident state instead of today's clean seed
 //   --json         machine-readable output (for alerting / cron)
 //   --ai           append an LLM-drafted plain-language summary in English and Spanish (DeepSeek, needs deepseek_api_key)
+//   --escalate     send the escalation email (report + AI summary) if there are critical/high findings
 // Exit code 2 when there is a critical/high finding, so a scheduler can page on it.
 const args = process.argv.slice(2);
 const flag = (f: string) => args.includes(f);
@@ -22,6 +25,12 @@ if (flag('--snapshot')) await loadIncidentSnapshot(db);
 const stuckAfter = stuckArg === undefined ? undefined : Number(stuckArg);
 const report = await runTriage(db, { stuckAfter });
 
+if (flag('--escalate')) {
+  const res = await processTriageEscalation(db, mailTransportFromEnv(), { stuckAfter });
+  const e = await latestEscalation(db);
+  console.error(res.escalated ? `Escalation email sent (${e?.summary ? 'with' : 'without'} AI summary${e?.summary_error ? `: ${e.summary_error}` : ''}).`
+    : report.status === 'action_needed' ? `Escalation NOT sent: ${'error' in res ? res.error : 'unknown error'}` : 'Nothing to escalate.');
+}
 if (flag('--json')) console.log(JSON.stringify(report, null, 2));
 else {
   console.log(formatReport(report));
