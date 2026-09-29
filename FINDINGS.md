@@ -216,3 +216,69 @@ The fix prevents new stranded payouts. It doesn't touch the seeded TX-0006, whic
 - **cancel:** post a `release` for 41,160 (memo referencing TX-0006 / TICKET-204) and set the status to `failed`, so the client resubmits with a new idempotency key.
 
 Other stranded transfers can be found with: `select t.id from transfers t where t.direction='outbound' and t.status='created' and not exists (select 1 from outbox o where o.transfer_id=t.id)`.
+
+---
+
+## TICKET-205 — Provider paid twice after a timeout; we only see one transfer
+
+### Reproduction
+`tests/ticket-205.test.ts` creates a $1,200.00 ACH payout with sandbox scenario `timeout_once` and runs the worker twice. The first pass times out after the provider has already accepted the payment, and the second pass is the retry. Before the fix it failed with `provider accepted it once: 2 !== 1`: the provider's `submissions` held two payouts for the same transfer, and `statement()` listed both.
+
+The seeded incident (TX-0007) shows the same shape. `grep CID-205 logs/incidents.ndjson` only shows `transfer.created` and `outbox.enqueued`, because the worker logs under its own correlation id (see 202). `grep TX-0007` and `grep PROV-0008` give the rest:
+
+```
+WORKER-pass-1  provider.submit_error     TX-0007 attempt=1 "provider timeout (no response)" will_retry=true
+WORKER-pass-2  provider.submitted        TX-0007 provider_ref=PROV-0020 attempt=2
+WORKER-pass-2  webhook.unknown_transfer  EVT-0009 provider_ref=PROV-0008 status=settled
+WORKER-pass-2  webhook.received          EVT-0021 provider_ref=PROV-0020 TX-0007 settled
+```
+
+`PROV-0008` is the first payout, the one that "timed out". The provider did pay it, and its `settled` webhook arrived later, but by then the transfer only knew about `PROV-0020`. So that webhook matched nothing. That's the `webhook.unknown_transfer` warning the ticket mentions, and it's why our side shows one transfer settled once while the provider's statement shows two payouts.
+
+### Mechanism
+A timeout doesn't tell us whether the provider got the request. Two different situations look identical from our side:
+
+| What really happened | What the worker sees |
+|---|---|
+| The request never reached the provider | timeout |
+| The provider accepted and paid, and the response was lost on the way back | timeout |
+
+The worker treats every provider error as transient: the outbox row goes back to `pending` and the next pass calls `provider.submit(t)` again. That call sent **no idempotency key**, although the provider supports one (`src/providers.ts`: "de-duplicates on a client-supplied idempotency key, if one is provided"). Without a key the provider can't tell a retry from a new payment, so it accepted the transfer a second time with a new `provider_ref` and paid the vendor again.
+
+The retry is necessary, because in the first situation nothing was paid. The bug was that the retry wasn't safe to repeat.
+
+### Fix
+`src/outbox.ts` (`processOutbox`): the worker passes the transfer id as the provider idempotency key on every attempt:
+
+```ts
+const res = provider.submit(t, t.id);
+```
+
+On a retry the provider recognises the key and returns the **original** `provider_ref` without paying again. It also returns the webhooks still pending from the first acceptance. The worker stores that original ref and applies the late `settled` webhook, which now matches the transfer. So the payout settles once, both at the provider and in our ledger.
+
+### Why it can't recur
+Whatever happened on the first attempt, every retry of a transfer carries the same key, so the provider accepts it at most once:
+- if the first attempt never arrived, the provider has never seen the key and pays normally;
+- if it arrived and was paid, the provider returns the existing acceptance.
+
+The worker doesn't need to know which case it was. This also closes the worker-side hole noted at the end of TICKET-204: a crash between `provider.submit` and marking the outbox row `processed` leads to a resubmission, and that resubmission is now harmless. The test asserts it from the provider's side, with exactly one submission for the transfer and one line on the settlement statement.
+
+### Ambiguity calls
+- **Transfer `id` as the key, not the client's `idempotency_key`.** They solve different problems. The client's key keeps the *client* from creating two transfers (TICKET-201). The provider key keeps *our worker* from submitting one transfer twice. `idempotency_key` is nullable, so a transfer created without one would still be paid twice. `id` always exists, is unique per transfer, and is identical on every retry because each attempt reads the same row.
+- **Idempotent retry, not "stop retrying after a timeout".** Never retrying a timeout would strand every payout whose request simply got lost. Blind retries pay twice. Only the provider knows which case happened, and the key is how we let it decide.
+- **We trust the provider to honour the key.** For this mock that's confirmed by its code and by the test, which counts the provider's own `submissions`. For a real provider, confirm it against their docs and a sandbox run before relying on it, and check four things:
+  - where the key goes (header vs body — a misplaced key is silently ignored);
+  - how long the provider remembers it, e.g. 24 h at Stripe (our retries happen within seconds, but a manual replay days later wouldn't be covered);
+  - what happens when the same key arrives with a different payload;
+  - how a retry that arrives while the first request is still processing is answered.
+- **`submit`'s key is still optional.** The next caller that writes `provider.submit(t)` (e.g. a manual resubmit on `/ops`) would bring the bug back without any warning. Follow-up, in the spirit of 202's `never` check: a single `submitTransfer(t)` wrapper that always derives the key, so there's no way to submit without one.
+
+### Still open (found while fixing this)
+- **A webhook that arrives before `provider_ref` is saved is lost.** After a timeout we never learn the `provider_ref`. In production the `settled` webhook comes over HTTP, and it can arrive before the retry. `handleWebhook` writes `processed_events` before it looks up the transfer, so the event is consumed as `unknown_transfer`, and the redelivery is skipped as a duplicate. The transfer stays `submitted` with its hold, although the provider paid. Reproduced by hand: first delivery `unknown_transfer`, redelivery `skipped`, final status `submitted`. It's the same bug class as 202, where an event is consumed that couldn't be applied. The fix is the same too: only mark the event processed once the transfer is found, and otherwise park it for replay. Alternatively, send our transfer id to the provider so the webhook carries it. In this test the idempotent retry happens to repair it, because the mock returns the late webhook in the retry response.
+- **An exhausted retry after a timeout may have been paid.** When the outbox row reaches `MAX_ATTEMPTS` and goes to `failed`, the transfer stays `created` with its hold. That's correct, because releasing the hold could hand back money that already left. But nothing escalates it beyond the stuck-payouts view, and it needs a human to ask the provider.
+
+### Follow-up (observability)
+Same as 202/203: the worker logs under `WORKER-pass-N`. The incident was only traceable by grepping the transfer id and then the first `provider_ref`. Logging each attempt's provider ref and key on `provider.submit_error` would make "did the first attempt get through?" a single query.
+
+### Remediation (not solved by code)
+The fix prevents new double payouts. It doesn't recover the one that already happened. For TX-0007 the provider paid $1,200.00 twice (`PROV-0008` and `PROV-0020`). Our ledger debited the client once (amount + fee on `PROV-0020`), so the client's balance is right, and **the extra payout is our loss, not the client's**. Ops should ask the provider to reverse `PROV-0008`, or recover it from the vendor, and record the outcome against TX-0007 / TICKET-205. `EVT-0009` is already in `processed_events`, so a redelivery of the first payout's webhook won't be applied. To find other affected payouts, look for provider submissions whose `provider_ref` doesn't match any transfer, or `webhook.unknown_transfer` warnings for a transfer that also has a `provider.submit_error`.
