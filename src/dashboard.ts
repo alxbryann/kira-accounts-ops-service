@@ -1,5 +1,6 @@
 import type { UnhandledEvent } from './escalations.js';
 import type { StuckTransfer, StuckReason } from './stuck.js';
+import type { TriageReport } from './monitor.js';
 import { toDollars } from './money.js';
 import { esc, kira, when } from './html.js';
 
@@ -61,12 +62,25 @@ function stuckTable(stuck: StuckTransfer[], stuckAfter: number) {
     <tbody>${stuck.map(stuckRow).join('')}</tbody></table></div>`;
 }
 
+// One row per monitor check: severity, what it means, how many and how much. Details live in /ops/triage.txt.
+function triageTable(r: TriageReport) {
+  return `<div class="card table-wrap"><table>
+    <thead><tr><th>Check</th><th>Severity</th><th class="num">Found</th><th class="num">Amount</th><th>What it means</th></tr></thead>
+    <tbody>${r.checks.map((c) => `<tr>
+      <td class="strong">${esc(c.title)}</td>
+      <td><span class="pill ${c.findings.length && c.severity !== 'medium' ? 'pill-bad' : 'pill-wait'}">${esc(c.severity)}</span></td>
+      <td class="num strong">${c.findings.length}</td>
+      <td class="num strong">${c.findings.length ? '$' + toDollars(c.at_risk_cents) : '—'}</td>
+      <td class="wrap"><div class="sub">${c.findings.length ? esc(c.findings[0].subject) + (c.findings.length > 1 ? ` and ${c.findings.length - 1} more` : '') : 'Nothing found.'}</div></td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
 // Simple stand-in for the Kira mark (a magenta diamond, same as in the escalation email); not the official asset.
 export const kiraMark = (size = 18) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true">
   <defs><linearGradient id="km" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${kira.pinkSoft}"/><stop offset="1" stop-color="${kira.magenta}"/></linearGradient></defs>
   <rect x="4.5" y="4.5" width="15" height="15" rx="2.5" transform="rotate(45 12 12)" fill="url(#km)"/></svg>`;
 
-export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash }: { events: UnhandledEvent[]; stuck?: StuckTransfer[]; stuckAfter?: number; flash?: string }) {
+export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash, triage }: { events: UnhandledEvent[]; stuck?: StuckTransfer[]; stuckAfter?: number; flash?: string; triage?: TriageReport }) {
   const open = events.filter((e) => !e.resolved_at);
   const resolved = events.filter((e) => e.resolved_at);
   // A transfer can be both stuck and the target of an open event: count its hold once.
@@ -186,6 +200,14 @@ export function renderDashboard({ events, stuck = [], stuckAfter = 30, flash }: 
       <div class="card stat"><div class="label">Funds on hold</div><div class="value">$${toDollars(held)}</div></div>
       <div class="card stat"><div class="label">Not yet escalated</div><div class="value">${notEscalated}</div></div>
     </div>
+
+    ${triage ? `<section>
+      <div class="section-head">
+        <div><div class="eyebrow">00 / Triage monitor</div><h2>${triage.status === 'ok' ? 'All clear' : triage.status === 'attention' ? 'Needs a look' : 'Action needed'}</h2>
+          <div class="hint">Every anomaly class behind the incident tickets. The full report, with a next step for each finding, is at <a class="strong" href="/ops/triage.txt">/ops/triage.txt</a>.</div></div>
+      </div>
+      ${triageTable(triage)}
+    </section>` : ''}
 
     <section>
       <div class="section-head">

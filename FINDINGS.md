@@ -95,7 +95,7 @@ Open points: `/ops` has no auth, like every other endpoint in this service; in p
 The worker logs under `WORKER-pass-N` instead of the request's `correlation_id`, so the ticket's own grep hides the webhook that explains the incident. Persisting `correlation_id` on the transfer (or the outbox row) and logging worker/webhook lines with it would make this a one-grep diagnosis.
 
 ### Remediation (not solved by code)
-TX-0004 in the seeded data stays `submitted` with its hold, because `EVT-0004` was already consumed and is in `processed_events`. Ops should confirm with the provider that the reversal is final, then either replay the outcome (`applyProviderResult(tx, 'reversed')`) or ask the provider to resend it with a fresh event id.
+In production the affected transfer (TX-0004 in the incident log) stays `submitted` with its hold, because `EVT-0004` was already consumed and is in `processed_events`. The fixed code seeds it correctly; the ops monitor's snapshot (`npm run monitor -- --snapshot`) shows the pre-fix state under *Stuck payouts*. Ops should confirm with the provider that the reversal is final, then either replay the outcome (`applyProviderResult(tx, 'reversed')`) or ask the provider to resend it with a fresh event id.
 
 ---
 
@@ -379,3 +379,31 @@ The brief asks for fixes that hold "for any sequence of events and under concurr
 **Mechanism.** `processOutbox` called `setStatus(t, 'submitted')` unconditionally after every accepted submit. If the process died after the provider accepted but before the outbox row was marked `processed`, and the outcome webhook landed in between over HTTP, the re-run of the submit (harmless at the provider since 205) overwrote `settled` with `submitted`. A later stale `failed` then passed `planTransition` as a transition from an open state and released the hold again. That is the 203 overstatement, reached through the worker.
 
 **Fix.** `markSubmitted` only moves `created → submitted`. It never touches a final status, and it keeps the existing `provider_ref`. The test settles a payout, re-runs its outbox event, sends a stale `failed`, and asserts the payout is still `settled`, the balance is right and there is exactly one release.
+
+---
+
+## Ops triage monitor
+
+`src/monitor.ts` scans the ledger, the outbox, the provider's submissions and its settlement statement. It reports one check per anomaly class, each with a severity, the money involved and a plain-language next step per finding. It is read-only and never moves money. Each check looks for the *shape* of the data, not for the bug, so it also catches a regression or a new cause with the same shape.
+
+| Check | Severity | Flags | Ticket class |
+|---|---|---|---|
+| Duplicate payouts | critical | more than one outbound transfer per client idempotency key | 201 |
+| Provider double submissions | critical | a transfer the provider accepted more than once; a provider payout matching no transfer | 205 |
+| Balance misstated | critical | release > hold, more than one debit, or a ledger net effect that doesn't match the status | 203 |
+| Stranded holds | high | a live hold with no provider ref and no pending outbox event, or a hold left on a final payout. Not age-gated: this state is never legitimate | 204 |
+| Ledger vs provider statement | high | statement-only / ledger-only payouts and fee mismatches, linked back to the transfer | 203, 205, 206 |
+| Stuck payouts | medium | the existing age-based backstop (`src/stuck.ts`), minus anything already reported as stranded | 202 |
+
+**How to run it**
+- `npm run monitor`: the plain-text report on today's (fixed, clean) seed → *ALL CLEAR*.
+- `npm run monitor -- --snapshot`: the same report on the **pre-fix incident state**. `src/incident-snapshot.ts` rewrites a fresh seed into what production was left with, following each ticket's *Remediation* section. After the fixes the seed no longer produces the incidents, so this is how the monitor is shown working on real incident data. It drops the 201 unique index, the way a database before that migration looks, so it is never used to serve the API.
+- `--json` for machines, `--stuck-after=N` to change the threshold, and `--ai` to append an **LLM-drafted summary in English and Spanish** (`src/triage-summary.ts`, DeepSeek chat completions, key `deepseek_api_key` in the `.env`). The model gets only the report, with amounts preformatted in dollars, and is told to use only the report's facts and amounts. The output is labelled a draft for human review.
+- Exit code `2` when there is a critical or high finding, so a scheduler can page on it.
+- Live: `GET /ops/triage` (JSON), `GET /ops/triage.txt` (report), and a *Triage monitor* summary at the top of `/ops`.
+
+On the snapshot it flags all six tickets. 201: duplicate `idem-201`. 202: stuck `submitted`. 203: hold released twice, plus a provider-settled payout recorded as `failed`. 204: stranded `created` hold. 205: accepted twice, plus the extra statement line linked to its transfer. 206: three 1¢ fee mismatches. The figures are in `tests/monitor.test.ts`. The "up to $X affected" total can count the same money under two checks, so it is labelled as an upper bound.
+
+**Ambiguity calls**
+- **Provider data source.** The double-submission check reads the mock's `submissions`. Against a real provider it would read their transfers or statement API, which is the only place a payout we never recorded can show up.
+- **What the monitor doesn't do.** It never auto-corrects. Every fix it suggests (release a hold, post a correcting entry, re-queue) is a money decision that needs the provider's confirmation or the client's answer first.

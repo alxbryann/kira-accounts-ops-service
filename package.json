@@ -9,7 +9,8 @@
     "demo": "tsx src/demo.ts",
     "dev": "tsx src/server.ts",
     "test": "tsx --test tests/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "monitor": "tsx src/monitor-cli.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.2.0",

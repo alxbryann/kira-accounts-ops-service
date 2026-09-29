@@ -30,4 +30,5 @@ console.log(`\n[TICKET-205] timeout payout: status=${t205[0]?.status}, provider 
 
 const r = await reconcile(db);
 console.log(`\n[TICKET-206] reconciliation: diff=${r.diffCents}c, fee mismatches=${r.feeMismatches.length}, statement-only payouts=${r.statementOnly.length}`);
+console.log('\nOps triage: `npm run monitor` (today) or `npm run monitor -- --snapshot` (the pre-fix incident state).');
 await db.close();
