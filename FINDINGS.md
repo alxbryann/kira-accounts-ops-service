@@ -282,3 +282,77 @@ Same as 202/203: the worker logs under `WORKER-pass-N`. The incident was only tr
 
 ### Remediation (not solved by code)
 The fix prevents new double payouts. It doesn't recover the one that already happened. For TX-0007 the provider paid $1,200.00 twice (`PROV-0008` and `PROV-0020`). Our ledger debited the client once (amount + fee on `PROV-0020`), so the client's balance is right, and **the extra payout is our loss, not the client's**. Ops should ask the provider to reverse `PROV-0008`, or recover it from the vendor, and record the outcome against TX-0007 / TICKET-205. `EVT-0009` is already in `processed_events`, so a redelivery of the first payout's webhook won't be applied. To find other affected payouts, look for provider submissions whose `provider_ref` doesn't match any transfer, or `webhook.unknown_transfer` warnings for a transfer that also has a `provider.submit_error`.
+
+---
+
+## TICKET-206 — Reconciliation doesn't net to zero
+
+### Reproduction
+`tests/ticket-206.test.ts` creates the five routine ACH payouts from the seed (`155,500 · 172,400 · 88,300 · 420,000 · 250,900`), runs the worker and calls `reconcile`. Before the fix it failed with 3 fee mismatches and `diffCents = 3`:
+
+```
+TX-0002  ledger_fee 4509  statement_fee 4510
+TX-0003  ledger_fee 4999  statement_fee 5000
+TX-0004  ledger_fee 2560  statement_fee 2561
+```
+
+### Separating the other tickets from the systemic cause
+To split the gap, I ran `reconcile` on the seeded dataset at the first commit, before any fix (`62f6add`). The result was `diffCents = 200,658`, which breaks down as follows:
+
+| Bucket | Rows | Cents | Cause |
+|---|---|---|---|
+| `statementOnly` | `PROV-0007` (75,000 + 2,175) | 77,175 | **203**: the provider paid, we marked it `failed` |
+| `statementOnly` | `PROV-0010` (120,000 + 3,480) | 123,480 | **205**: the first payout of a timed-out submit, paid a second time |
+| `feeMismatches` | TX-0008, TX-0009, TX-0010 | 3 | **206**: systemic fee rounding |
+| | | **200,658** | |
+
+With 201–205 fixed, the same seed reconciles to `diff = 3c` with 3 fee mismatches. That leftover is the systemic part.
+
+Three tickets **don't show up in reconciliation at all**. That's worth knowing, because a green reconciliation doesn't rule them out:
+- **201**: the duplicate transfer was settled on both sides (`PROV-0001` and `PROV-0003` are both in our ledger and on the statement), so the totals agree even though the vendor was paid twice.
+- **202 and 204**: `reconcile` only compares `settled` transfers against settled statement lines. A payout stuck in `submitted` or `created` with a hold isn't on either side.
+
+### Mechanism
+The fee is computed on both sides of the reconciliation, and the two sides round differently:
+- **Ours** (`src/money.ts`): `Math.floor(amount * 0.029)`, which always rounds down.
+- **Provider** (`src/providers.ts`, `statement()`): `Math.floor(amount * 0.029 + 0.5)`, which rounds half-up ("fees rounded half-up").
+
+They agree whenever the fractional cent is below .5, and they differ by exactly 1¢ when it is .5 or above. In the seed, 155,500 → 4509.5, 172,400 → 4999.6 and 88,300 → 2560.7 all fall in that range, while 250,900 → 7276.1 and 420,000 → 12180 don't. Roughly half of all payouts are affected, and each one is off by 1¢, so the drift grows with volume and never cancels out: we undercharge the client 1¢ against what the provider books for us.
+
+The old code also had a latent second issue: `amount * 0.029` is floating point (`88_300 * 0.029 = 2560.7000000000003`). A result that should land exactly on an integer could come out as `x.9999…` and floor one cent low. I found no amount where that happens in the range swept (up to $200,000), but it's a correctness-by-luck property.
+
+### Fix
+`src/money.ts`: `feeCents` now rounds half-up like the provider, and uses integer arithmetic with the rate in basis points:
+
+```ts
+export function feeCents(amountCents: Cents, rateBps = 290): Cents {
+  return Math.floor((amountCents * rateBps + 5_000) / 10_000);
+}
+```
+
+`amount * 290` is an exact integer (safe up to ~$310 billion per payout), so the only rounding is the one we ask for. I checked it against the provider's formula for every amount from 0 to 20,000,000¢: 0 mismatches.
+
+### Why it can't recur
+`tests/ticket-206.test.ts` has 4 tests. All 4 fail against the old `feeCents` and pass with the fix:
+- The seeded payouts reconcile to exactly 0, with no fee mismatches, no statement-only rows and no ledger-only rows.
+- A 155,500 payout debits the client amount + 4,510 (the provider's fee), checked on the balance, not only in reconciliation.
+- Boundary cases for `feeCents`: exact .5, above .5, below .5, the float-noisy 88,300, exact multiples, tiny amounts, 0.
+- A sweep of ~21,000 amounts is submitted to the mock provider, and `statement()`'s fee is compared with `feeCents` for each one. The test compares against the provider's own output, not a copy of its formula, so if the provider's rule changes, this test fails.
+
+Full suite: 35/35 pass. `npm run demo` now reports `diff=0c, fee mismatches=0, statement-only payouts=0`.
+
+### Ambiguity calls
+- **Match the provider, rather than ask the provider to match us.** The statement is what we actually get charged, so our ledger has to agree with it. The downside is that clients now pay up to 1¢ more on about half of their payouts. That should be confirmed with Finance and reflected in the pricing terms if they state a rounding rule.
+- **Half-up, not banker's rounding.** It's what the provider documents and does. For a real provider, confirm the rule against their fee schedule and a few real statement lines before trusting it. Some providers round per statement line and others per batch, and per-batch rounding would need a different fix: reconcile fees on the batch total.
+- **Basis points in the signature.** `rate = 0.029` was a float by design, which is how the imprecision got in. `rateBps` keeps the API integer-only. No caller passed a custom rate.
+
+### Remediation (not solved by code)
+Fees already stored in `transfers.fee_cents` keep the old floored value. The fix only affects new transfers. On existing data, `GET /reconciliation`'s `feeMismatches` lists every affected transfer (`ledger_fee` vs `statement_fee`). In this dataset that's 3 transfers (155,500, 172,400 and 88,300), 1¢ each. Finance should decide between two options:
+- post a correcting 1¢ fee debit per transfer (memo referencing the transfer and TICKET-206);
+- absorb the difference as a platform write-off, since we were undercharging.
+
+Either way, record the decision and leave `fee_cents` on the old rows unchanged, so the audit trail shows what was charged at the time.
+
+### Follow-up
+- **Make reconciliation self-explaining.** Today it returns one `diffCents` plus three lists, and it takes manual work to tell "a whole payout is missing" (the class of 203/205) from "1¢ fee drift" (206). Returning the diff per bucket (`statementOnlyCents`, `ledgerOnlyCents`, `feeDriftCents`) would let the ops monitor alert on each separately.
+- **Cover what reconciliation can't see.** A duplicate idempotency key among settled transfers (201), and non-final transfers older than N minutes that still hold funds (202/204), are both invisible to a totals match. The second one is already on `/ops/stuck-transfers`.
