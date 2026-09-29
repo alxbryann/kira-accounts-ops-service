@@ -2,7 +2,10 @@ import express from 'express';
 import type { PGlite } from '@electric-sql/pglite';
 import { availableCents } from './ledger.js';
 import { createOutboundTransfer, getTransfer } from './transfers.js';
-import { handleWebhook } from './webhooks.js';
+import { handleWebhook, replayUnhandledEvents } from './webhooks.js';
+import { listUnhandledEvents } from './escalations.js';
+import { renderDashboard } from './dashboard.js';
+import { listStuckTransfers, stuckAfterMinutes } from './stuck.js';
 import { processOutbox } from './outbox.js';
 import { reconcile } from './reconciliation.js';
 import * as provider from './providers.js';
@@ -34,6 +37,22 @@ export function createApp(db: PGlite) {
   app.get('/outbox', wrap(async (_req, res) => res.json((await db.query(`select * from outbox order by id`)).rows)));
   app.get('/provider/submissions', (_req, res) => res.json(provider.submissions));
   app.get('/reconciliation', wrap(async (_req, res) => res.json(await reconcile(db))));
+  // Ops triage: stuck payouts (age-based backstop) and webhooks parked because their status is unknown.
+  app.get('/ops', wrap(async (req, res) => {
+    const replayed = Number(req.query.replayed), still = Number(req.query.still);
+    const flash = Number.isInteger(replayed) && Number.isInteger(still) ? `Replayed ${replayed} event(s); ${still} still unrecognised.` : undefined;
+    const stuckAfter = stuckAfterMinutes(req.query.stuck_after ?? process.env.STUCK_AFTER_MINUTES);
+    res.type('html').send(renderDashboard({ events: await listUnhandledEvents(db), stuck: await listStuckTransfers(db, stuckAfter), stuckAfter, flash }));
+  }));
+  app.get('/ops/unhandled-events', wrap(async (_req, res) => res.json(await listUnhandledEvents(db))));
+  // ?stuck_after=<minutes> overrides STUCK_AFTER_MINUTES (default 30).
+  app.get('/ops/stuck-transfers', wrap(async (req, res) => res.json(await listStuckTransfers(db, stuckAfterMinutes(req.query.stuck_after ?? process.env.STUCK_AFTER_MINUTES)))));
+  app.post('/ops/unhandled-events/replay', wrap(async (req, res) => {
+    const results = await replayUnhandledEvents(db);
+    if (req.query.redirect === undefined) return res.json(results);
+    const still = results.filter((r) => r.result === 'still_unhandled').length;
+    res.redirect(303, `/ops?replayed=${results.length - still}&still=${still}`);
+  }));
   app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     log('api.error', { error: err.message }, '-', 'error');
     res.status(err.status ?? 500).json({ error: err.message });

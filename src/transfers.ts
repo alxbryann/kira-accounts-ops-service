@@ -81,7 +81,7 @@ export async function setStatus(db: PGlite, id: string, status: string, provider
 }
 
 // While a transfer is in one of these states its hold is still live and no debit has been posted.
-const OPEN_STATUSES = ['created', 'submitted', 'pending'];
+export const OPEN_STATUSES = ['created', 'submitted', 'pending'];
 
 export type Transition = { to: string; entries: { entry_type: 'debit' | 'release' | 'credit'; memo: string }[] };
 

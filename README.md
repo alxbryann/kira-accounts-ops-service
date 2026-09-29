@@ -34,6 +34,10 @@ npm run demo     # print the open incidents
 npm run dev      # API on :3000 — /health, /accounts/:id/balance, POST /transfers,
                  #   GET /transfers/:id, POST /webhooks/provider, POST /worker/run,
                  #   GET /outbox, GET /provider/submissions, GET /reconciliation
+                 #   GET /ops  (triage dashboard: stuck payouts + webhooks with an unrecognised status)
+                 #   GET /ops/stuck-transfers, GET /ops/unhandled-events; STUCK_AFTER_MINUTES (default 30)
+                 #   escalation mail: SMTP_URL, ALERT_EMAIL_TO, ALERT_EMAIL_FROM, OPS_DASHBOARD_URL
+                 #   (without SMTP_URL mails are written to ./logs/mail/*.eml)
                  #   (PORT=3100 npm run dev if :3000 is busy)
 npm test         # baseline suite (currently GREEN — it does NOT cover the bugs)
 npm run typecheck
