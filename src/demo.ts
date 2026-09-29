@@ -21,8 +21,8 @@ const e203 = await q(`select entry_type, count(*)::int c from ledger_entries whe
 console.log(`\n[TICKET-203] out-of-order payout: status=${t203[0]?.status} (provider paid it) · ledger entries: ${e203.map((r:any)=>r.entry_type+'x'+r.c).join(', ')}`);
 
 const t204 = await q(`select id, status, provider_ref from transfers where idempotency_key='idem-204'`);
-const o204 = await q(`select count(*)::int c from outbox where transfer_id=$1`, [t204[0]?.id ?? '']);
-console.log(`\n[TICKET-204] crashed request: status=${t204[0]?.status}, provider_ref=${t204[0]?.provider_ref ?? 'NULL'}, outbox events=${o204[0]?.c} (funds held, never submitted?)`);
+const stranded = await q(`select count(*)::int c from transfers t where t.direction='outbound' and t.status='created' and not exists (select 1 from outbox o where o.transfer_id=t.id)`);
+console.log(`\n[TICKET-204] crashed request: ${t204.length ? `status=${t204[0].status}` : 'rolled back, no transfer left behind'} · held transfers with no outbox event: ${stranded[0].c} (funds held, never submitted?)`);
 
 const t205 = await q(`select id, status from transfers where idempotency_key='idem-205'`);
 const subs205 = provider.submissions.filter((s) => s.transfer_id === t205[0]?.id).length;
